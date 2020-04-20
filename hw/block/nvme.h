@@ -18,11 +18,15 @@ typedef struct NvmeAsyncEvent {
     NvmeAerResult result;
 } NvmeAsyncEvent;
 
+enum NvmeRequestFlags {
+    NVME_REQ_FLG_HAS_SG   = 1 << 0,
+};
+
 typedef struct NvmeRequest {
     struct NvmeSQueue       *sq;
     BlockAIOCB              *aiocb;
     uint16_t                status;
-    bool                    has_sg;
+    uint16_t                flags;
     NvmeCqe                 cqe;
     BlockAcctCookie         acct;
     QEMUSGList              qsg;
