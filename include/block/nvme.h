@@ -593,20 +593,35 @@ typedef struct QEMU_PACKED NvmeDsmRange {
     uint64_t    slba;
 } NvmeDsmRange;
 
-enum NvmeAsyncEventRequest {
-    NVME_AER_TYPE_ERROR                     = 0,
-    NVME_AER_TYPE_SMART                     = 1,
-    NVME_AER_TYPE_IO_SPECIFIC               = 6,
-    NVME_AER_TYPE_VENDOR_SPECIFIC           = 7,
-    NVME_AER_INFO_ERR_INVALID_DB_REGISTER   = 0,
-    NVME_AER_INFO_ERR_INVALID_DB_VALUE      = 1,
-    NVME_AER_INFO_ERR_DIAG_FAIL             = 2,
-    NVME_AER_INFO_ERR_PERS_INTERNAL_ERR     = 3,
-    NVME_AER_INFO_ERR_TRANS_INTERNAL_ERR    = 4,
-    NVME_AER_INFO_ERR_FW_IMG_LOAD_ERR       = 5,
+enum NvmeAsyncEventType {
+    NVME_AER_TYPE_ERROR                     = 0x00,
+    NVME_AER_TYPE_SMART                     = 0x01,
+    NVME_AER_TYPE_NOTICE                    = 0x02,
+    NVME_AER_TYPE_CMDSET_SPECIFIC           = 0x06,
+    NVME_AER_TYPE_VENDOR_SPECIFIC           = 0x07,
+};
+
+enum NvmeAsyncErrorInfo {
+    NVME_AER_INFO_ERR_INVALID_DB_REGISTER   = 0x00,
+    NVME_AER_INFO_ERR_INVALID_DB_VALUE      = 0x01,
+    NVME_AER_ERR_DIAG_FAIL                  = 0x02,
+    NVME_AER_ERR_PERS_INTERNAL_ERR          = 0x03,
+    NVME_AER_ERR_TRANS_INTERNAL_ERR         = 0x04,
+    NVME_AER_ERR_FW_IMG_LOAD_ERR            = 0x05,
+};
+
+enum NvmeAsyncSmartInfo {
     NVME_AER_INFO_SMART_RELIABILITY         = 0,
     NVME_AER_INFO_SMART_TEMP_THRESH         = 1,
     NVME_AER_INFO_SMART_SPARE_THRESH        = 2,
+};
+
+enum NvmeAsyncNoticeInfo {
+    NVME_AER_NOTICE_NS_CHANGED              = 0x00,
+};
+
+enum NvmeAsyncEventCfg {
+    NVME_AEN_CFG_NS_ATTR                    = 1 << 8,
 };
 
 typedef struct QEMU_PACKED NvmeAerResult {
