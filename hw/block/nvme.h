@@ -16,6 +16,7 @@ typedef struct NvmeParams {
     uint8_t  aerl;
     uint32_t aer_max_queued;
 
+    char        *zone_file;
     bool        zoned;
     bool        cross_zone_read;
     bool        zone_async_events;
@@ -115,6 +116,27 @@ typedef struct NvmeZoneList {
     uint8_t         rsvd12[4];
 } NvmeZoneList;
 
+#define NVME_ZONE_META_MAGIC 0x3aebaa70
+#define NVME_ZONE_META_VER  1
+
+typedef struct NvmeZoneMeta {
+    uint32_t        magic;
+    uint32_t        version;
+    uint64_t        zone_size;
+    uint64_t        zone_capacity;
+    uint32_t        nr_offline_zones;
+    uint32_t        nr_rdonly_zones;
+    uint32_t        lba_size;
+    uint32_t        rsvd40;
+    NvmeZoneList    exp_open_zones;
+    NvmeZoneList    imp_open_zones;
+    NvmeZoneList    closed_zones;
+    NvmeZoneList    full_zones;
+    uint8_t         zd_extension_size;
+    uint8_t         dirty;
+    uint8_t         rsvd594[3990];
+} NvmeZoneMeta;
+
 typedef struct NvmeNamespace {
     NvmeIdNs        id_ns;
     uint32_t        nsid;
@@ -123,6 +145,7 @@ typedef struct NvmeNamespace {
 
     NvmeIdNsZoned   *id_ns_zoned;
     NvmeZone        *zone_array;
+    NvmeZoneMeta    *zone_meta;
     NvmeZoneList    *exp_open_zones;
     NvmeZoneList    *imp_open_zones;
     NvmeZoneList    *closed_zones;
@@ -190,6 +213,7 @@ typedef struct NvmeCtrl {
 
     int             zone_file_fd;
     uint32_t        num_zones;
+    size_t          meta_size;
     uint64_t        zone_size_bs;
     uint64_t        zone_array_size;
     uint64_t        rzr_delay_ns;
@@ -300,6 +324,19 @@ static inline NvmeZone *nvme_next_zone_in_list(NvmeNamespace *ns, NvmeZone *z,
     return &ns->zone_array[z->next];
 }
 
+static inline bool nvme_zone_meta_dirty(NvmeCtrl *n, NvmeNamespace *ns)
+{
+    return n->params.zone_file ? ns->zone_meta->dirty : false;
+}
+
+static inline void nvme_set_zone_meta_dirty(NvmeCtrl *n, NvmeNamespace *ns,
+    bool yesno)
+{
+    if (n->params.zone_file) {
+        ns->zone_meta->dirty = yesno;
+    }
+}
+
 static inline int nvme_ilog2(uint64_t i)
 {
     int log = -1;
@@ -313,6 +350,7 @@ static inline int nvme_ilog2(uint64_t i)
 
 static inline void _hw_nvme_check_size(void)
 {
+    QEMU_BUILD_BUG_ON(sizeof(NvmeZoneMeta) != 4096);
     QEMU_BUILD_BUG_ON(sizeof(NvmeZoneList) != 16);
     QEMU_BUILD_BUG_ON(sizeof(NvmeZone) != 88);
 }
