@@ -160,9 +160,6 @@ static const uint32_t nvme_cse_acs[256] = {
     [NVME_ADM_CMD_ASYNC_EV_REQ]     = NVME_CMD_EFF_CSUPP,
 };
 
-static const uint32_t nvme_cse_iocs_none[256] = {
-};
-
 static const uint32_t nvme_cse_iocs_nvm[256] = {
     [NVME_CMD_FLUSH]                = NVME_CMD_EFF_CSUPP | NVME_CMD_EFF_LBCC,
     [NVME_CMD_WRITE_ZEROES]         = NVME_CMD_EFF_CSUPP | NVME_CMD_EFF_LBCC,
@@ -2074,6 +2071,10 @@ static uint16_t nvme_io_cmd(NvmeCtrl *n, NvmeRequest *req)
         return NVME_INVALID_FIELD | NVME_DNR;
     }
 
+    if (NVME_CC_CSS(n->bar.cc) == NVME_CC_CSS_NVM &&
+        !(nvme_cse_iocs_nvm[req->cmd.opcode] & NVME_CMD_EFF_CSUPP)) {
+        return NVME_INVALID_OPCODE | NVME_DNR;
+    }
     if (!(req->ns->iocs[req->cmd.opcode] & NVME_CMD_EFF_CSUPP)) {
         trace_pci_nvme_err_invalid_opc(req->cmd.opcode);
         return NVME_INVALID_OPCODE | NVME_DNR;
@@ -3310,35 +3311,6 @@ static void nvme_clear_ctrl(NvmeCtrl *n)
     n->bar.cc = 0;
 }
 
-static void nvme_activate_namespaces(NvmeCtrl *n)
-{
-    NvmeNamespace *ns;
-    int i;
-
-    for (i = 1; i <= n->num_namespaces; i++) {
-        ns = nvme_ns(n, i);
-        if (!ns) {
-            continue;
-        }
-        ns->iocs = nvme_cse_iocs_none;
-        if (!ns->params.attached) {
-            continue;
-        }
-        switch (ns->csi) {
-        case NVME_CSI_NVM:
-            if (NVME_CC_CSS(n->bar.cc) != NVME_CC_CSS_ADMIN_ONLY) {
-                ns->iocs = nvme_cse_iocs_nvm;
-            }
-            break;
-        case NVME_CSI_ZONED:
-            if (NVME_CC_CSS(n->bar.cc) == NVME_CC_CSS_CSI) {
-                ns->iocs = nvme_cse_iocs_zoned;
-            }
-            break;
-        }
-    }
-}
-
 static int nvme_start_ctrl(NvmeCtrl *n)
 {
     uint32_t page_bits = NVME_CC_MPS(n->bar.cc) + 12;
@@ -3447,8 +3419,6 @@ static int nvme_start_ctrl(NvmeCtrl *n)
     nvme_set_timestamp(n, 0ULL);
 
     QTAILQ_INIT(&n->aer_queue);
-
-    nvme_activate_namespaces(n);
 
     return 0;
 }

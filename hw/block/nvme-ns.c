@@ -43,6 +43,7 @@ static void nvme_ns_init(NvmeNamespace *ns)
     id_ns->nsze = cpu_to_le64(nvme_ns_nlbas(ns));
 
     ns->csi = NVME_CSI_NVM;
+    ns->iocs = nvme_cse_iocs_nvm;
 
     /* no thin provisioning */
     id_ns->ncap = id_ns->nsze;
@@ -260,6 +261,7 @@ static int nvme_zoned_init_ns(NvmeCtrl *n, NvmeNamespace *ns, int lba_index,
         ns->params.zd_extension_size >> 6; /* Units of 64B */
 
     ns->csi = NVME_CSI_ZONED;
+    ns->iocs = nvme_cse_iocs_zoned;
     ns->id_ns.nsze = cpu_to_le64(ns->zone_size * ns->num_zones);
     ns->id_ns.ncap = cpu_to_le64(ns->zone_capacity * ns->num_zones);
     ns->id_ns.nuse = ns->id_ns.ncap;
