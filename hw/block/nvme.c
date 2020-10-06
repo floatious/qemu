@@ -1197,8 +1197,9 @@ static uint16_t nvme_smart_info(NvmeCtrl *n, uint8_t rae, uint32_t buf_len,
 
     if (nsid != 0xffffffff) {
         ns = nvme_ns(n, nsid);
-        if (!ns)
+        if (!ns) {
             return NVME_INVALID_NSID | NVME_DNR;
+        }
         nvme_set_blk_stats(ns, &stats);
     } else {
         int i;
