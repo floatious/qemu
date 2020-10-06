@@ -929,9 +929,9 @@ static void nvme_rw_cb(void *opaque, int ret)
 
 static uint16_t nvme_flush(NvmeCtrl *n, NvmeRequest *req)
 {
-    block_acct_start(blk_get_stats(n->conf.blk), &req->acct, 0,
+    block_acct_start(blk_get_stats(req->ns->blkconf.blk), &req->acct, 0,
                      BLOCK_ACCT_FLUSH);
-    req->aiocb = blk_aio_flush(n->conf.blk, nvme_rw_cb, req);
+    req->aiocb = blk_aio_flush(req->ns->blkconf.blk, nvme_rw_cb, req);
     return NVME_NO_COMPLETE;
 }
 
@@ -953,9 +953,9 @@ static uint16_t nvme_write_zeroes(NvmeCtrl *n, NvmeRequest *req)
         return status;
     }
 
-    block_acct_start(blk_get_stats(n->conf.blk), &req->acct, 0,
+    block_acct_start(blk_get_stats(ns->blkconf.blk), &req->acct, 0,
                      BLOCK_ACCT_WRITE);
-    req->aiocb = blk_aio_pwrite_zeroes(n->conf.blk, offset, count,
+    req->aiocb = blk_aio_pwrite_zeroes(ns->blkconf.blk, offset, count,
                                        BDRV_REQ_MAY_UNMAP, nvme_rw_cb, req);
     return NVME_NO_COMPLETE;
 }
