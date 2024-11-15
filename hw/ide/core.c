@@ -182,6 +182,8 @@ static void ide_identify(IDEState *s)
         put_le16(p + 75, s->ncq_queues - 1);
         /* NCQ supported */
         put_le16(p + 76, (1 << 8));
+        /* NCQ autosense supported */
+        put_le16(p + 78, (1 << 7));
     }
 
     put_le16(p + 80, 0xf0); /* ata3 -> ata6 supported */

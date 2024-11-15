@@ -1229,15 +1229,15 @@ static int ncq_check_should_fail(const NCQFrame *ncq_fis, NCQTransferState *ncq_
     // with the additional sense code set to COMMAND TIMEOUT BEFORE PROCESSING
     // sense key == ABORTED COMMAND (0xb), ASC == 0x2e, ASCQ == 0x01
     if (ncq_fis->command == WRITE_FPDMA_QUEUED && ncq_fis->sector_count_low == 123) {
-        s->sense_key = SK_ABORTED_CMD;
-        s->asc = 0x2e;
-        s->ascq = 0x01;
-
         ncq_err_log = &s->ncq_err_log;
         ncq_err_log->ncq_tag_etc = ncq_tfs->tag;
 
         ncq_err_log->status = READY_STAT | ERR_STAT | SENSE_DATA_AVAIL;
         ncq_err_log->error = ABRT_ERR;
+
+        ncq_err_log->sense_key = s->sense_key = SK_ABORTED_CMD;
+        ncq_err_log->asc = s->asc = 0x2e;
+        ncq_err_log->ascq = s->ascq = 0x01;
         //TODO: should we add more fields? e.g. lba and final_lba_in error...
 
         /* checksum */
