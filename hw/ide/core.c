@@ -227,8 +227,10 @@ static void ide_identify(IDEState *s)
         put_le16(p + 110, s->wwn >> 16);
         put_le16(p + 111, s->wwn);
     }
-    /* READ LOG DMA EXT supported */
-    put_le16(p + 119, (1 << 14) | (1 << 3));
+    /* Sense Data Reporting feature set supported, READ LOG DMA EXT supported */
+    put_le16(p + 119, (1 << 14) | (1 << 6) | (1 << 3));
+    /* Sense Data Reporting feature set enabled */
+    put_le16(p + 120, (1 << 14) | (1 << 6));
     if (dev && dev->conf.discard_granularity) {
         put_le16(p + 169, 1); /* TRIM support */
     }
@@ -1485,6 +1487,8 @@ static void handle_id_dev_current_settings(uint8_t *buf)
 
     // Contents of QWord are valid (8..15)
     v = BIT(63);
+    // Sense Data Reporting enabled
+    v |= BIT(10);
     p = (uint64_t *) &buf[8];
     *p = cpu_to_le64(v);
 }
@@ -1507,7 +1511,9 @@ static void handle_id_dev_supported_capabilities(uint8_t *buf)
     v = BIT(63);
     // GPL supported, and GPL DMA supported
     v |= BIT(11) | BIT(2);
-    p = (uint64_t *) &s->io_buffer[8];
+    // Sense Data Reporting supported
+    v |= BIT(5);
+    p = (uint64_t *) &buf[8];
     *p = cpu_to_le64(v);
 }
 
@@ -1591,6 +1597,23 @@ static bool cmd_read_log_ext(IDEState *s, uint8_t cmd)
 
 abort:
     ide_abort_command(s);
+    return true;
+}
+
+#define SENSE_DATA_AVAIL 0x2
+static bool cmd_request_sense_data_ext(IDEState *s, uint8_t cmd)
+{
+    s->sector = s->ascq;
+    s->lcyl = s->asc;
+    s->hcyl = s->sense_key;
+
+    // Completion of a REQUEST SENSE DATA EXT command shall clear the sense data
+    s->sense_key = 0;
+    s->asc = 0;
+    s->ascq = 0;
+
+    s->status |= SENSE_DATA_AVAIL;
+
     return true;
 }
 
@@ -2268,6 +2291,7 @@ static const struct {
     [WIN_IDENTIFY]                = { cmd_identify, ALL_OK },
     [READ_LOG_EXT]                = { cmd_read_log_ext, ALL_OK },
     [READ_LOG_DMA_EXT]            = { cmd_read_log_ext, ALL_OK },
+    [REQUEST_SENSE_DATA_EXT]      = { cmd_request_sense_data_ext, ALL_OK },
     [WIN_SETFEATURES]             = { cmd_set_features, ALL_OK | SET_DSC },
     [IBM_SENSE_CONDITION]         = { cmd_ibm_sense_condition, CFA_OK | SET_DSC },
     [CFA_WEAR_LEVEL]              = { cmd_cfa_erase_sectors, HD_CFA_OK | SET_DSC },

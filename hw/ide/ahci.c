@@ -1323,6 +1323,18 @@ static void handle_reg_h2d_fis(AHCIState *s, int port,
         return;
     }
 
+    /*
+     * Sense data should be cleared when receiving a command that is not
+     * READ LOG DMA EXT or READ LOG DMA, or REQUEST SENSE DATA EXT.
+     * TODO: also add RECEIVE FPDMA QUEUED with subcmd READ LOG DMA EXT.
+     * (However, right now the kernel never sends this.)
+     */
+    if (cmd_fis[2] != 0x47 && cmd_fis[2] != 0x2F && cmd_fis[2] != 0x0B) {
+        ide_state->sense_key = 0;
+        ide_state->asc = 0;
+        ide_state->ascq = 0;
+    }
+
     /* Check for NCQ command */
     if (is_ncq(cmd_fis[2])) {
         process_ncq_command(s, port, cmd_fis, slot);

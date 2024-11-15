@@ -65,7 +65,7 @@
 /* reserved                             0x07 */
 #define WIN_DEVICE_RESET                0x08
 /* reserved                             0x09..0x0a */
-/* REQUEST SENSE DATA EXT               0x0B */
+#define REQUEST_SENSE_DATA_EXT          0x0B
 /* reserved                             0x0C..0x0F */
 #define WIN_RECAL                       0x10 /* obsolete since ATA4 */
 /* obsolete since ATA3, retired in ATA4 0x11..0x1F */
