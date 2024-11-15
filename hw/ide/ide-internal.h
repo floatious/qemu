@@ -314,6 +314,8 @@
 #define SMART_DISABLE         0xd9
 #define SMART_STATUS          0xda
 
+extern void ncq_clear_pending(IDEState *s);
+
 extern const char *IDE_DMA_CMD_lookup[IDE_DMA__COUNT];
 
 extern const MemoryRegionPortio ide_portio_list[];

@@ -50,6 +50,25 @@ enum ide_dma_cmd {
     IDE_DMA__COUNT
 };
 
+typedef struct QEMU_PACKED NCQCmdErrorLog {
+    uint8_t ncq_tag_etc;
+    uint8_t rsvd1;
+    uint8_t status;
+    uint8_t error;
+    uint8_t lba_low[3];
+    uint8_t device;
+    uint8_t lba_high[3];
+    uint8_t rsvd11;
+    uint16_t count;
+    uint8_t sense_key;
+    uint8_t asc;
+    uint8_t ascq;
+    uint8_t final_lba_in_error[6];
+    uint8_t rsvd23[233];
+    uint8_t vs[255];
+    uint8_t checksum;
+} NCQCmdErrorLog;
+
 /* NOTE: IDEState represents in fact one drive */
 struct IDEState {
     IDEBus *bus;
@@ -141,6 +160,8 @@ struct IDEState {
     uint8_t *smart_selftest_data;
     /* AHCI */
     int ncq_queues;
+    NCQCmdErrorLog ncq_err_log;
+    bool in_error_state;
 };
 
 struct IDEDeviceClass {

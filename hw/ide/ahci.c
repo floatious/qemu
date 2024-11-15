@@ -783,10 +783,10 @@ static void ahci_unmap_clb_address(AHCIDevice *ad)
     ad->lst = NULL;
 }
 
-static void ahci_write_fis_sdb(AHCIState *s, NCQTransferState *ncq_tfs)
+static void ahci_write_fis_sdb(AHCIDevice *ad)
 {
-    AHCIDevice *ad = ncq_tfs->drive;
     AHCIPortRegs *pr = &ad->port_regs;
+    AHCIState *s = ad->hba;
     IDEState *ide_state;
     SDBFIS *sdb_fis;
 
@@ -1013,14 +1013,23 @@ out:
     return r;
 }
 
-static void ncq_err(NCQTransferState *ncq_tfs)
+static void ncq_stop_queue(AHCIDevice *ad);
+
+static void __ncq_err(NCQTransferState *ncq_tfs, uint8_t extra_status)
 {
     IDEState *ide_state = &ncq_tfs->drive->port.ifs[0];
 
+    ide_state->in_error_state = true;
+    ncq_stop_queue(ncq_tfs->drive);
     ide_state->error = ABRT_ERR;
-    ide_state->status = READY_STAT | ERR_STAT;
+    ide_state->status = READY_STAT | ERR_STAT | extra_status;
     qemu_sglist_destroy(&ncq_tfs->sglist);
     ncq_tfs->used = 0;
+}
+
+static void ncq_err(NCQTransferState *ncq_tfs)
+{
+    __ncq_err(ncq_tfs, 0);
 }
 
 static void __ncq_finish(NCQTransferState *ncq_tfs, bool account)
@@ -1032,7 +1041,7 @@ static void __ncq_finish(NCQTransferState *ncq_tfs, bool account)
         ncq_tfs->drive->finished |= (1 << ncq_tfs->tag);
     }
 
-    ahci_write_fis_sdb(ncq_tfs->drive->hba, ncq_tfs);
+    ahci_write_fis_sdb(ncq_tfs->drive);
 
     trace_ncq_finish(ncq_tfs->drive->hba, ncq_tfs->drive->port_no,
                      ncq_tfs->tag);
@@ -1055,6 +1064,9 @@ static void ncq_cb(void *opaque, int ret)
     IDEState *ide_state = &ncq_tfs->drive->port.ifs[0];
 
     ncq_tfs->aiocb = NULL;
+
+    if (ide_state->in_error_state)
+        return;
 
     if (ret < 0) {
         bool is_read = ncq_tfs->cmd == READ_FPDMA_QUEUED;
@@ -1162,6 +1174,88 @@ static void execute_ncq_command(NCQTransferState *ncq_tfs)
     }
 }
 
+#define SK_ABORTED_CMD 0xb
+#define SENSE_DATA_AVAIL 0x2
+
+static void ncq_stop_queue(AHCIDevice *ad)
+{
+    AHCIState *s = ad->hba;
+    int port = ad->port_no;
+    int i;
+
+    for (i = 0; i < AHCI_MAX_CMDS; i++) {
+        NCQTransferState *ncq_tfs = &s->dev[port].ncq_tfs[i];
+        ncq_tfs->halt = false;
+        if (!ncq_tfs->used) {
+            continue;
+        }
+
+        if (ncq_tfs->aiocb) {
+            blk_aio_cancel(ncq_tfs->aiocb);
+            ncq_tfs->aiocb = NULL;
+        }
+
+        /* Maybe we just finished the request thanks to blk_aio_cancel() */
+        if (!ncq_tfs->used) {
+            continue;
+        }
+
+        qemu_sglist_destroy(&ncq_tfs->sglist);
+        ncq_tfs->used = 0;
+    }
+}
+
+void ncq_clear_pending(IDEState *s)
+{
+    const IDEDMA *dma = s->bus->dma;
+    AHCIDevice *ad = DO_UPCAST(AHCIDevice, dma, dma);
+    ad->finished = 0xffffffff;
+    s->status = READY_STAT | SEEK_STAT;
+    s->error = 0;
+    ahci_write_fis_sdb(ad);
+}
+
+static int ncq_check_should_fail(const NCQFrame *ncq_fis, NCQTransferState *ncq_tfs, IDEState *s)
+{
+    NCQCmdErrorLog *ncq_err_log;
+    uint8_t *ncq_err_log_raw;
+    int n;
+
+    ncq_tfs->aiocb = NULL;
+
+    // SENSE DATA AVAILABLE and ERROR bit set in STATUS field,
+    // ABORT bit set ERROR field.
+    //
+    // with the additional sense code set to COMMAND TIMEOUT BEFORE PROCESSING
+    // sense key == ABORTED COMMAND (0xb), ASC == 0x2e, ASCQ == 0x01
+    if (ncq_fis->command == WRITE_FPDMA_QUEUED && ncq_fis->sector_count_low == 123) {
+        s->sense_key = SK_ABORTED_CMD;
+        s->asc = 0x2e;
+        s->ascq = 0x01;
+
+        ncq_err_log = &s->ncq_err_log;
+        ncq_err_log->ncq_tag_etc = ncq_tfs->tag;
+
+        ncq_err_log->status = READY_STAT | ERR_STAT | SENSE_DATA_AVAIL;
+        ncq_err_log->error = ABRT_ERR;
+        //TODO: should we add more fields? e.g. lba and final_lba_in error...
+
+        /* checksum */
+        ncq_err_log_raw = (uint8_t *)&s->ncq_err_log;
+        ncq_err_log_raw[511] = 0;
+        for (n = 0; n < 511; n++) {
+            ncq_err_log_raw[511] += ncq_err_log_raw[n];
+        }
+        ncq_err_log_raw[511] = 0x100 - ncq_err_log_raw[511];
+
+        __ncq_err(ncq_tfs, SENSE_DATA_AVAIL);
+        __ncq_finish(ncq_tfs, false);
+
+        return 1;
+    }
+
+    return 0;
+}
 
 static void process_ncq_command(AHCIState *s, int port, const uint8_t *cmd_fis,
                                 uint8_t slot)
@@ -1170,6 +1264,7 @@ static void process_ncq_command(AHCIState *s, int port, const uint8_t *cmd_fis,
     const NCQFrame *ncq_fis = (NCQFrame *)cmd_fis;
     uint8_t tag = ncq_fis->tag >> 3;
     NCQTransferState *ncq_tfs = &ad->ncq_tfs[tag];
+    IDEState *ide_state = &ad->port.ifs[0];
     size_t size;
 
     g_assert(is_ncq(ncq_fis->command));
@@ -1177,6 +1272,11 @@ static void process_ncq_command(AHCIState *s, int port, const uint8_t *cmd_fis,
         /* error - already in use */
         qemu_log_mask(LOG_GUEST_ERROR, "%s: tag %d already used\n",
                       __func__, tag);
+        return;
+    }
+
+    if (ide_state->in_error_state) {
+        ide_abort_command(ide_state);
         return;
     }
 
@@ -1250,6 +1350,9 @@ static void process_ncq_command(AHCIState *s, int port, const uint8_t *cmd_fis,
         trace_process_ncq_command_large(s, port, tag,
                                         ncq_tfs->sglist.size, size);
     }
+
+    if (ncq_check_should_fail(ncq_fis, ncq_tfs, ide_state))
+        return;
 
     trace_process_ncq_command(s, port, tag,
                               ncq_fis->command,

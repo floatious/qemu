@@ -1386,6 +1386,7 @@ static void ide_reset(IDEState *s)
 
     s->select = (ATA_DEV_ALWAYS_ON);
     s->status = READY_STAT | SEEK_STAT;
+    s->in_error_state = false;
 
     s->lba48 = 0;
 
@@ -1543,8 +1544,22 @@ static void handle_log_dir(uint8_t *buf)
     p = (uint16_t *)buf;
     // General Purpose Logging Version
     put_le16(p + 0, 1);
+    // Number of log pages for NCQ Command Error log
+    put_le16(p + 0x10, 1);
     // Number of log pages for IDENTIFY DEVICE data log
     put_le16(p + 0x30, 3);
+}
+
+static void handle_ncq_err_log(uint8_t *buf, IDEState *s)
+{
+    uint8_t *src = (uint8_t *)&s->ncq_err_log;
+
+    memcpy(buf, src, 512);
+
+    if (s->in_error_state) {
+        ncq_clear_pending(s);
+        s->in_error_state = false;
+    }
 }
 
 bool ide_read_log_to_buffer(IDEState *s,
@@ -1558,6 +1573,11 @@ bool ide_read_log_to_buffer(IDEState *s,
         if (nsector != 1 || page_number != 0)
             return false;
         handle_log_dir(buf);
+        break;
+    case 0x10: // NCQ Command Error log
+        if (nsector != 1 || page_number != 0 || !s->ncq_queues)
+            return false;
+        handle_ncq_err_log(buf, s);
         break;
     case 0x30: // IDENTIFY DEVICE data log
         if (nsector != 1)
