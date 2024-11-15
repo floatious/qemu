@@ -300,6 +300,7 @@ typedef struct NCQTransferState {
     uint64_t lba;
     uint8_t tag;
     uint8_t cmd;
+    uint8_t subcmd;
     uint8_t slot;
     bool used;
     bool halt;

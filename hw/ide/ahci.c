@@ -1023,7 +1023,7 @@ static void ncq_err(NCQTransferState *ncq_tfs)
     ncq_tfs->used = 0;
 }
 
-static void ncq_finish(NCQTransferState *ncq_tfs)
+static void __ncq_finish(NCQTransferState *ncq_tfs, bool account)
 {
     /* If we didn't error out, set our finished bit. Errored commands
      * do not get a bit set for the SDB FIS ACT register, nor do they
@@ -1037,10 +1037,16 @@ static void ncq_finish(NCQTransferState *ncq_tfs)
     trace_ncq_finish(ncq_tfs->drive->hba, ncq_tfs->drive->port_no,
                      ncq_tfs->tag);
 
-    block_acct_done(blk_get_stats(ncq_tfs->drive->port.ifs[0].blk),
-                    &ncq_tfs->acct);
+    if (account)
+        block_acct_done(blk_get_stats(ncq_tfs->drive->port.ifs[0].blk),
+                        &ncq_tfs->acct);
     qemu_sglist_destroy(&ncq_tfs->sglist);
     ncq_tfs->used = 0;
+}
+
+static void ncq_finish(NCQTransferState *ncq_tfs)
+{
+    __ncq_finish(ncq_tfs, true);
 }
 
 static void ncq_cb(void *opaque, int ret)
@@ -1085,6 +1091,37 @@ static int is_ncq(uint8_t ata_cmd)
     }
 }
 
+static void recv_fpdma_queued(NCQTransferState *ncq_tfs)
+{
+    AHCIDevice *ad = ncq_tfs->drive;
+    IDEState *s = &ad->port.ifs[0];
+    uint8_t subcmd = ncq_tfs->subcmd;
+    uint8_t log_address = ncq_tfs->lba & 0xff;
+    uint8_t page_number = ncq_tfs->lba & 0xf00; //only handles page_nbr up to 255
+    uint32_t nsector = 2; //TODO: get real value
+    uint8_t *buf = malloc(512 * nsector);
+    bool ret;
+
+    if (subcmd != 0x1) // READ LOG DMA EXT
+        return;
+
+    ncq_tfs->aiocb = NULL;
+
+    ret = ide_read_log_to_buffer(s, buf, log_address, page_number, nsector);
+    if (!ret) {
+        free(buf);
+        ncq_err(ncq_tfs);
+        __ncq_finish(ncq_tfs, false);
+    }
+
+    dma_buf_read(buf, 512 * nsector, NULL, &ncq_tfs->sglist, MEMTXATTRS_UNSPECIFIED);
+    free(buf);
+
+    s->error = 0;
+    s->status = READY_STAT | SEEK_STAT;
+    __ncq_finish(ncq_tfs, false);
+}
+
 static void execute_ncq_command(NCQTransferState *ncq_tfs)
 {
     AHCIDevice *ad = ncq_tfs->drive;
@@ -1114,6 +1151,9 @@ static void execute_ncq_command(NCQTransferState *ncq_tfs)
                                        ncq_tfs->lba << BDRV_SECTOR_BITS,
                                        BDRV_SECTOR_SIZE,
                                        ncq_cb, ncq_tfs);
+        break;
+    case RECEIVE_FPDMA_QUEUED:
+        recv_fpdma_queued(ncq_tfs);
         break;
     default:
         trace_execute_ncq_command_unsup(ad->hba, port,
@@ -1170,6 +1210,8 @@ static void process_ncq_command(AHCIState *s, int port, const uint8_t *cmd_fis,
                    ((uint64_t)ncq_fis->lba1 << 8) |
                    (uint64_t)ncq_fis->lba0;
     ncq_tfs->tag = tag;
+    // only valid for RECEIVE FPDMA QUEUED
+    ncq_tfs->subcmd = ncq_fis->prio & 0x1f;
 
     /* Sanity-check the NCQ packet */
     if (tag != slot) {
