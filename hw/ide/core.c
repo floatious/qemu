@@ -190,11 +190,12 @@ static void ide_identify(IDEState *s)
     put_le16(p + 82, (1 << 14) | (1 << 5) | 1);
     /* 13=flush_cache_ext,12=flush_cache,10=lba48 */
     put_le16(p + 83, (1 << 14) | (1 << 13) | (1 <<12) | (1 << 10));
-    /* 14=set to 1, 8=has WWN, 1=SMART self test, 0=SMART error logging */
+    /* 14=set to 1, 8=has WWN, 5=has GPL, 1=SMART self test,
+       0=SMART error logging */
     if (s->wwn) {
-        put_le16(p + 84, (1 << 14) | (1 << 8) | 0);
+        put_le16(p + 84, (1 << 14) | (1 << 8) | (1 << 5) | 0);
     } else {
-        put_le16(p + 84, (1 << 14) | 0);
+        put_le16(p + 84, (1 << 14) | (1 << 5) | 0);
     }
     /* 14 = NOP supported, 5=WCACHE enabled, 0=SMART feature set enabled */
     if (blk_enable_write_cache(s->blk)) {
@@ -202,8 +203,8 @@ static void ide_identify(IDEState *s)
     } else {
         put_le16(p + 85, (1 << 14) | 1);
     }
-    /* 13=flush_cache_ext,12=flush_cache,10=lba48 */
-    put_le16(p + 86, (1 << 13) | (1 <<12) | (1 << 10));
+    /* 13=flush_cache_ext,12=flush_cache,10=lba48,15=word119..120 are valid */
+    put_le16(p + 86, (1 << 13) | (1 <<12) | (1 << 10) | (1 << 15));
     /* 14=set to 1, 8=has WWN, 1=SMART self test, 0=SMART error logging */
     if (s->wwn) {
         put_le16(p + 87, (1 << 14) | (1 << 8) | 0);
@@ -226,6 +227,8 @@ static void ide_identify(IDEState *s)
         put_le16(p + 110, s->wwn >> 16);
         put_le16(p + 111, s->wwn);
     }
+    /* READ LOG DMA EXT supported */
+    put_le16(p + 119, (1 << 14) | (1 << 3));
     if (dev && dev->conf.discard_granularity) {
         put_le16(p + 169, 1); /* TRIM support */
     }
@@ -1466,6 +1469,131 @@ static bool cmd_identify(IDEState *s, uint8_t cmd)
     return true;
 }
 
+static void handle_id_dev_current_settings(uint8_t *buf)
+{
+    uint64_t *p;
+    uint64_t v;
+
+    memset(buf, 0, 0x200);
+
+    // Revision number
+    buf[0] = 1;
+    // Page number
+    buf[2] = 0x4;
+    // Shall be set to 1
+    buf[7] = BIT(7);
+
+    // Contents of QWord are valid (8..15)
+    v = BIT(63);
+    p = (uint64_t *) &buf[8];
+    *p = cpu_to_le64(v);
+}
+
+static void handle_id_dev_supported_capabilities(uint8_t *buf)
+{
+    uint64_t *p;
+    uint64_t v;
+
+    memset(buf, 0, 0x200);
+
+    // Revision number
+    buf[0] = 1;
+    // Page number
+    buf[2] = 0x3;
+    // Shall be set to 1
+    buf[7] = BIT(7);
+
+    // Contents of QWord are valid (8..15)
+    v = BIT(63);
+    // GPL supported, and GPL DMA supported
+    v |= BIT(11) | BIT(2);
+    p = (uint64_t *) &s->io_buffer[8];
+    *p = cpu_to_le64(v);
+}
+
+static void handle_id_dev_list_supported_pages(uint8_t *buf)
+{
+    memset(buf, 0, 0x200);
+
+    // Revision number
+    buf[0] = 1;
+    // Page number
+    buf[2] = 0x0;
+
+    // Number of entries
+    buf[8] = 3;
+    // Put all log pages implemented in the IDENTIFY DEVICE data log
+    buf[9] = 0x0;  // IDENTIFY DEVICE data - List of supported pages
+    buf[10] = 0x3; // IDENTIFY DEVICE data - Supported Capabilities
+    buf[11] = 0x4; // IDENTIFY DEVICE data - Current Settings
+}
+
+static void handle_log_dir(uint8_t *buf)
+{
+    uint16_t *p;
+
+    memset(buf, 0, 0x200);
+
+    p = (uint16_t *)buf;
+    // General Purpose Logging Version
+    put_le16(p + 0, 1);
+    // Number of log pages for IDENTIFY DEVICE data log
+    put_le16(p + 0x30, 3);
+}
+
+bool ide_read_log_to_buffer(IDEState *s,
+                            uint8_t *buf,
+                            uint8_t log_address,
+                            uint8_t page_number,
+                            uint32_t nsector)
+{
+    switch (log_address) {
+    case 0x0: // General Purpose Log directory
+        if (nsector != 1 || page_number != 0)
+            return false;
+        handle_log_dir(buf);
+        break;
+    case 0x30: // IDENTIFY DEVICE data log
+        if (nsector != 1)
+            return false;
+        if (page_number == 0x0) // List of supported pages
+            handle_id_dev_list_supported_pages(buf);
+        else if (page_number == 0x3) // Supported Capabilities
+            handle_id_dev_supported_capabilities(buf);
+        else if (page_number == 0x4) // Current Settings
+            handle_id_dev_current_settings(buf);
+        else
+            return false;
+        break;
+    default:
+        return false;
+    }
+
+    return true;
+}
+
+static bool cmd_read_log_ext(IDEState *s, uint8_t cmd)
+{
+    uint8_t log_address = s->sector;
+    uint8_t page_number = s->lcyl; //only LSB, MSB is in s->hob_lcyl
+    uint32_t nsector = s->nsector;
+    bool ret;
+
+    ret = ide_read_log_to_buffer(s, s->io_buffer, log_address, page_number,
+                                 nsector);
+    if (!ret)
+        goto abort;
+
+    s->status = READY_STAT | SEEK_STAT;
+    ide_transfer_start(s, s->io_buffer, 512 * nsector, ide_transfer_stop);
+    ide_bus_set_irq(s->bus);
+    return false;
+
+abort:
+    ide_abort_command(s);
+    return true;
+}
+
 static bool cmd_verify(IDEState *s, uint8_t cmd)
 {
     bool lba48 = (cmd == WIN_VERIFY_EXT);
@@ -2138,6 +2266,8 @@ static const struct {
     [WIN_FLUSH_CACHE]             = { cmd_flush_cache, ALL_OK },
     [WIN_FLUSH_CACHE_EXT]         = { cmd_flush_cache, HD_CFA_OK },
     [WIN_IDENTIFY]                = { cmd_identify, ALL_OK },
+    [READ_LOG_EXT]                = { cmd_read_log_ext, ALL_OK },
+    [READ_LOG_DMA_EXT]            = { cmd_read_log_ext, ALL_OK },
     [WIN_SETFEATURES]             = { cmd_set_features, ALL_OK | SET_DSC },
     [IBM_SENSE_CONDITION]         = { cmd_ibm_sense_condition, CFA_OK | SET_DSC },
     [CFA_WEAR_LEVEL]              = { cmd_cfa_erase_sectors, HD_CFA_OK | SET_DSC },

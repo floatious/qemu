@@ -81,7 +81,7 @@
 /* READ STREAM DMA EXT                  0x2A */
 /* READ STREAM EXT                      0x2B */
 /* reserved                             0x2C..0x2E */
-/* READ LOG EXT                         0x2F */
+#define READ_LOG_EXT                    0x2F
 #define WIN_WRITE                       0x30 /* 28-Bit */
 #define WIN_WRITE_ONCE                  0x31 /* 28-Bit w/o retries, obsolete since ATA5 */
 /* obsolete since ATA4                  0x32..0x33 */
@@ -104,7 +104,7 @@
 /* reserved                             0x43..0x44 */
 /* WRITE UNCORRECTABLE EXT              0x45 */
 /* reserved                             0x46 */
-/* READ LOG DMA EXT                     0x47 */
+#define READ_LOG_DMA_EXT                0x47
 /* reserved                             0x48..0x4F */
 /* obsolete since ATA4                  0x50 */
 /* CONFIGURE STREAM                     0x51 */
@@ -424,6 +424,8 @@ void ide_bus_set_irq(IDEBus *bus);
 void ide_bus_register_restart_cb(IDEBus *bus);
 
 void ide_bus_exec_cmd(IDEBus *bus, uint32_t val);
+bool ide_read_log_to_buffer(IDEState *s, uint8_t *buf, uint8_t log_address,
+                            uint8_t page_number, uint32_t nsector);
 
 void ide_transfer_start(IDEState *s, uint8_t *buf, int size,
                         EndTransferFunc *end_transfer_func);
