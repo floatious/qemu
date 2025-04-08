@@ -1474,6 +1474,14 @@ static bool cmd_identify(IDEState *s, uint8_t cmd)
     return true;
 }
 
+static void handle_id_dev_id_dev_data_log(uint8_t *buf, IDEState *s)
+{
+    uint16_t *p = (uint16_t *)s->identify_data;
+
+    memset(buf, 0, 0x200);
+    memcpy(buf, p, sizeof(s->identify_data));
+}
+
 static void handle_id_dev_current_settings(uint8_t *buf)
 {
     uint64_t *p;
@@ -1530,11 +1538,12 @@ static void handle_id_dev_list_supported_pages(uint8_t *buf)
     buf[2] = 0x0;
 
     // Number of entries
-    buf[8] = 3;
+    buf[8] = 4;
     // Put all log pages implemented in the IDENTIFY DEVICE data log
     buf[9] = 0x0;  // IDENTIFY DEVICE data - List of supported pages
-    buf[10] = 0x3; // IDENTIFY DEVICE data - Supported Capabilities
-    buf[11] = 0x4; // IDENTIFY DEVICE data - Current Settings
+    buf[10] = 0x1; // IDENTIFY DEVICE data - Copy of IDENTIFY DEVICE data
+    buf[11] = 0x3; // IDENTIFY DEVICE data - Supported Capabilities
+    buf[12] = 0x4; // IDENTIFY DEVICE data - Current Settings
 }
 
 static void handle_log_dir(uint8_t *buf)
@@ -1549,7 +1558,7 @@ static void handle_log_dir(uint8_t *buf)
     // Number of log pages for NCQ Command Error log
     put_le16(p + 0x10, 1);
     // Number of log pages for IDENTIFY DEVICE data log
-    put_le16(p + 0x30, 3);
+    put_le16(p + 0x30, 4);
 }
 
 static void handle_ncq_err_log(uint8_t *buf, IDEState *s)
@@ -1586,6 +1595,8 @@ bool ide_read_log_to_buffer(IDEState *s,
             return false;
         if (page_number == 0x0) // List of supported pages
             handle_id_dev_list_supported_pages(buf);
+        else if (page_number == 0x1) // Copy of IDENTIFY DEVICE data
+            handle_id_dev_id_dev_data_log(buf, s);
         else if (page_number == 0x3) // Supported Capabilities
             handle_id_dev_supported_capabilities(buf);
         else if (page_number == 0x4) // Current Settings
