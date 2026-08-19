@@ -2311,6 +2311,17 @@ calculate_refcounts(BlockDriverState *bs, BdrvCheckResult *res,
         }
     }
 
+    /* zoned metadata */
+    if (s->zoned_header.zoned != QCOW2_Z_NONE) {
+        ret = qcow2_inc_refcounts_imrt(bs, res, refcount_table, nb_clusters,
+                                       s->zoned_header.zonedmeta_offset,
+                                       (int64_t)s->zoned_header.nr_zones *
+                                       sizeof(uint64_t));
+        if (ret < 0) {
+            return ret;
+        }
+    }
+
     /* bitmaps */
     ret = qcow2_check_bitmaps_refcounts(bs, res, refcount_table, nb_clusters);
     if (ret < 0) {
