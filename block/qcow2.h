@@ -130,7 +130,6 @@
 #define DEFAULT_CLUSTER_SIZE 65536
 
 #define DEFAULT_ZONE_SIZE (256 * MiB)
-#define DEFAULT_ZONE_MAX_APPEND_BYTES (64 * KiB)
 
 #define QCOW2_Z_NONE 0 /* Regular block device */
 #define QCOW2_Z_HM 1 /* Host-managed zoned block device */
@@ -253,11 +252,10 @@ typedef struct Qcow2ZonedHeaderExtension {
     uint32_t nr_zones;
     uint64_t zone_size;
     uint64_t zone_capacity;
+    uint64_t zonedmeta_offset;
     uint32_t conventional_zones;
     uint32_t max_active_zones;
     uint32_t max_open_zones;
-    uint32_t max_append_bytes;
-    uint64_t zonedmeta_offset;
 } QEMU_PACKED Qcow2ZonedHeaderExtension;
 
 typedef struct Qcow2ZoneListEntry {

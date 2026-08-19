@@ -216,13 +216,6 @@ This section describes each format and the options that are supported for it.
     If the limits of open zones or active zones are equal to the number of
     SWR zones, then it is the same as having no limits.
 
-  .. option:: zone.max_append_bytes
-
-    The maximum number of bytes of a zone append request that can be issued
-    to the device. It must be 512-byte aligned and less than the zone
-    capacity. A value of ``0`` means that zone append requests are not
-    supported. Defaults to ``64 KiB``.
-
 .. program:: image-formats
 .. option:: qed
 

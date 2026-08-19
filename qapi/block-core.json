@@ -5262,10 +5262,6 @@
 #     open, explicit open or closed state.  It is less than or equal
 #     to the number of zones (default: 0, meaning no limit).
 #
-# @max-append-bytes: The maximal size in bytes of a zone-append
-#     request that can be issued to the device.  Must be a multiple
-#     of 512, and less than @capacity (default: 64 KB).
-#
 # Since: 11.1
 ##
 { 'struct': 'Qcow2ZoneHostManaged',
@@ -5273,8 +5269,7 @@
             '*capacity':      'size',
             '*conventional-zones': 'uint32',
             '*max-open-zones':     'uint32',
-            '*max-active-zones':   'uint32',
-            '*max-append-bytes':   'size' } }
+            '*max-active-zones':   'uint32' } }
 
 ##
 # @Qcow2ZoneCreateOptions:

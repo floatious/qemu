@@ -61,7 +61,6 @@
 #define BLOCK_OPT_ZONE_SIZE         "zone.size"
 #define BLOCK_OPT_ZONE_CAPACITY     "zone.capacity"
 #define BLOCK_OPT_CONVENTIONAL_ZONES    "zone.conventional_zones"
-#define BLOCK_OPT_MAX_APPEND_BYTES      "zone.max_append_bytes"
 #define BLOCK_OPT_MAX_ACTIVE_ZONES      "zone.max_active_zones"
 #define BLOCK_OPT_MAX_OPEN_ZONES        "zone.max_open_zones"
 

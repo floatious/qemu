@@ -550,21 +550,6 @@ qcow2_check_zone_options(Qcow2ZonedHeaderExtension *zone_opt)
         return false;
     }
 
-    if (!QEMU_IS_ALIGNED(zone_opt->max_append_bytes, BDRV_SECTOR_SIZE)) {
-        warn_report("max append bytes %" PRIu32 "B is not aligned "
-                    "to %" PRIu64, zone_opt->max_append_bytes,
-                    (uint64_t)BDRV_SECTOR_SIZE);
-        return false;
-    }
-
-    if ((uint64_t)zone_opt->max_append_bytes + BDRV_SECTOR_SIZE >=
-        zone_opt->zone_capacity) {
-        warn_report("max append bytes %" PRIu32 "B exceeds zone "
-                    "capacity %" PRIu64 "B by more than block size",
-                    zone_opt->max_append_bytes, zone_opt->zone_capacity);
-        return false;
-    }
-
     if (zone_opt->conventional_zones >= zone_opt->nr_zones) {
         warn_report("Conventional_zones %" PRIu32 " exceeds "
                     "nr_zones %" PRIu32 ".",
@@ -859,8 +844,6 @@ qcow2_read_extensions(BlockDriverState *bs, uint64_t start_offset,
             zoned_ext.max_open_zones = be32_to_cpu(zoned_ext.max_open_zones);
             zoned_ext.max_active_zones =
                 be32_to_cpu(zoned_ext.max_active_zones);
-            zoned_ext.max_append_bytes =
-                be32_to_cpu(zoned_ext.max_append_bytes);
             zoned_ext.zonedmeta_offset =
                 be64_to_cpu(zoned_ext.zonedmeta_offset);
 
@@ -2601,8 +2584,6 @@ static void qcow2_refresh_limits(BlockDriverState *bs, Error **errp)
     }
 
     bs->bl.nr_zones = s->zoned_header.nr_zones;
-    bs->bl.max_append_sectors = s->zoned_header.max_append_bytes
-        >> BDRV_SECTOR_BITS;
     bs->bl.max_active_zones = s->zoned_header.max_active_zones;
     bs->bl.max_open_zones = s->zoned_header.max_open_zones;
     bs->bl.zone_size = s->zoned_header.zone_size;
@@ -4151,8 +4132,6 @@ int qcow2_update_header(BlockDriverState *bs)
             .max_open_zones     = cpu_to_be32(s->zoned_header.max_open_zones),
             .max_active_zones   =
                 cpu_to_be32(s->zoned_header.max_active_zones),
-            .max_append_bytes =
-                cpu_to_be32(s->zoned_header.max_append_bytes),
             .zonedmeta_offset   =
                 cpu_to_be64(s->zoned_header.zonedmeta_offset),
         };
@@ -4915,13 +4894,6 @@ qcow2_co_create(BlockdevCreateOptions *create_options, Error **errp)
             s->zoned_header.max_open_zones = 0;
         }
 
-        if (zone_host_managed->has_max_append_bytes) {
-            s->zoned_header.max_append_bytes =
-                    zone_host_managed->max_append_bytes;
-        } else {
-            s->zoned_header.max_append_bytes = DEFAULT_ZONE_MAX_APPEND_BYTES;
-        }
-
         if (!qcow2_check_zone_options(&s->zoned_header)) {
             error_setg(errp, "Invalid zoned device options");
             s->zoned_header.zoned = QCOW2_Z_NONE;
@@ -5131,7 +5103,6 @@ qcow2_co_create_opts(BlockDriver *drv, const char *filename, QemuOpts *opts,
         { BLOCK_OPT_CONVENTIONAL_ZONES, "zone.conventional-zones" },
         { BLOCK_OPT_MAX_OPEN_ZONES,     "zone.max-open-zones" },
         { BLOCK_OPT_MAX_ACTIVE_ZONES,   "zone.max-active-zones" },
-        { BLOCK_OPT_MAX_APPEND_BYTES,   "zone.max-append-bytes" },
         { NULL, NULL },
     };
 
@@ -5802,13 +5773,6 @@ qcow2_co_zone_append(BlockDriverState *bs, int64_t *offset, QEMUIOVector *qiov,
     }
 
     len = qiov->size;
-
-    if ((len >> BDRV_SECTOR_BITS) > bs->bl.max_append_sectors) {
-        error_report("len 0x%" PRIx64 " in sectors is greater than "
-                     "max_append_sectors 0x%" PRIx32 "",
-                     len >> BDRV_SECTOR_BITS, bs->bl.max_append_sectors);
-        return -EINVAL;
-    }
 
     return qcow2_co_pwv_part(bs, offset, len, qiov, 0, true, 0);
 }
@@ -6983,8 +6947,6 @@ qcow2_get_specific_info(BlockDriverState *bs, Error **errp)
                     .max_open_zones = s->zoned_header.max_open_zones,
                     .has_max_active_zones = true,
                     .max_active_zones = s->zoned_header.max_active_zones,
-                    .has_max_append_bytes = true,
-                    .max_append_bytes = s->zoned_header.max_append_bytes,
                 },
             };
             spec_info->u.qcow2.data->zone = z;
@@ -7832,11 +7794,6 @@ static QemuOptsList qcow2_create_opts = {
             .name = BLOCK_OPT_CONVENTIONAL_ZONES,                       \
             .type = QEMU_OPT_NUMBER,                                    \
             .help = "numbers of conventional zones",                    \
-        },                                                              \
-        {                                                               \
-            .name = BLOCK_OPT_MAX_APPEND_BYTES,                         \
-            .type = QEMU_OPT_SIZE,                                      \
-            .help = "max append bytes",                                 \
         },                                                              \
         {                                                               \
             .name = BLOCK_OPT_MAX_ACTIVE_ZONES,                         \
