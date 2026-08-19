@@ -32,7 +32,7 @@ echo "=== Initial image setup ==="
 echo
 
 $QEMU_IMG create -f qcow2 $file_name -o size=768M -o zone.size=64M -o \
-zone.capacity=64M -o zone.conventional_zones=0 -o zone.max_append_bytes=32M \
+zone.capacity=64M -o zone.conventional_zones=0 \
 -o zone.max_open_zones=6 -o zone.max_active_zones=8 -o zone.mode=host-managed
 
 IMG="--image-opts -n driver=qcow2,file.driver=file,file.filename=$file_name"

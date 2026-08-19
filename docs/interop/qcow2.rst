@@ -411,17 +411,21 @@ The fields of the zoned extension are::
                    which has the constraint of aligning to some hardware erase
                    block size.
 
-         24 - 27:  conventional_zones
+         24 - 31:  zonedmeta_offset
+                   The offset of zoned metadata structure in the contained
+                   image, in bytes.
+
+         32 - 35:  conventional_zones
                    The number of conventional zones. The conventional zones
                    allow sequential writes and random writes. While the
                    sequential zones only allow sequential writes.
 
-         28 - 31:  max_active_zones
+         36 - 39:  max_active_zones
                    The maximum allowed active zones (zones in the implicit
                    open, explicit open, or closed state). It cannot be larger
                    than nr_zones.
 
-         32 - 35:  max_open_zones
+         40 - 43:  max_open_zones
                    The maximum allowed open zones (zones in the implicit open
                    or explicit open state). It cannot be larger than the number
                    of SWR zones of the device, nor larger than max_active_zones.
@@ -430,18 +434,6 @@ The fields of the zoned extension are::
                    the total number of SWR zones, then it's the same as having
                    no limits therefore max open zones and max active zones are
                    set to 0.
-
-         36 - 39:  max_append_bytes
-                   The maximum number of bytes of a zone append request that
-                   can be issued to the device. It must be 512-byte aligned
-                   and less than the zone capacity.
-
-                   A value of 0 means that the zone append requests are not
-                   supported.
-
-         40 - 47:  zonedmeta_offset
-                   The offset of zoned metadata structure in the contained
-                   image, in bytes.
 
 The zonedmeta clusters contain a table of the zone write pointers. Each entry
 is a 64-bit value encoding both the zone type and the zone's write pointer::
