@@ -2607,7 +2607,6 @@ static void qcow2_refresh_limits(BlockDriverState *bs, Error **errp)
     bs->bl.max_open_zones = s->zoned_header.max_open_zones;
     bs->bl.zone_size = s->zoned_header.zone_size;
     bs->bl.zone_capacity = s->zoned_header.zone_capacity;
-    bs->bl.write_granularity = BDRV_SECTOR_SIZE;
 }
 
 static int GRAPH_UNLOCKED
@@ -5788,7 +5787,6 @@ qcow2_co_zone_append(BlockDriverState *bs, int64_t *offset, QEMUIOVector *qiov,
     assert(flags == 0);
     int64_t capacity = bs->total_sectors << BDRV_SECTOR_BITS;
     int64_t zone_size_mask = bs->bl.zone_size - 1;
-    int64_t iov_len = 0;
     int64_t len = 0;
 
     if (*offset >= capacity) {
@@ -5803,16 +5801,6 @@ qcow2_co_zone_append(BlockDriverState *bs, int64_t *offset, QEMUIOVector *qiov,
         return -EINVAL;
     }
 
-    int64_t wg = bs->bl.write_granularity;
-    int64_t wg_mask = wg - 1;
-    for (int i = 0; i < qiov->niov; i++) {
-        iov_len = qiov->iov[i].iov_len;
-        if (iov_len & wg_mask) {
-            error_report("len of IOVector[%d] 0x%" PRIx64 " is not aligned to "
-                         "block size 0x%" PRIx64 "", i, iov_len, wg);
-            return -EINVAL;
-        }
-    }
     len = qiov->size;
 
     if ((len >> BDRV_SECTOR_BITS) > bs->bl.max_append_sectors) {
