@@ -5603,18 +5603,25 @@ qcow2_reset_zone(BlockDriverState *bs, uint32_t index,
     BDRVQcow2State *s = bs->opaque;
     unsigned int nrz = bs->bl.nr_zones;
     int64_t zone_size = bs->bl.zone_size;
+    int64_t capacity = bs->total_sectors << BDRV_SECTOR_BITS;
+    int64_t zone_start;
     unsigned int n;
     int ret = 0;
     bool any_dirtied = false;
 
     qemu_co_mutex_lock(&bs->wps->colock);
     uint64_t *wp = &bs->wps->wp[index];
-    if (len == bs->total_sectors << BDRV_SECTOR_BITS) {
+    if (len == capacity) {
         n = nrz;
         index = 0;
         wp = &bs->wps->wp[0];
     } else {
-        n = len / zone_size;
+        /*
+         * A trailing zone that is shorter than the zone size still counts as
+         * a whole zone, otherwise resetting it alone would round down to no
+         * zone at all.
+         */
+        n = DIV_ROUND_UP(len, zone_size);
     }
 
     for (unsigned int i = 0; i < n; ++i) {
@@ -5664,9 +5671,13 @@ qcow2_reset_zone(BlockDriverState *bs, uint32_t index,
          * Zero the data extent first. Data write fires before the WP cluster
          * hits disk. So the wp advance cannot become durable while stale data
          * is still readable.
+         *
+         * The last zone is shorter than the zone size when the device
+         * capacity is not a multiple of it, so stop at the end of the device.
          */
-        ret = qcow2_co_pwrite_zeroes(bs, (uint64_t)(index + i) * zone_size,
-                                     zone_size, 0);
+        zone_start = (uint64_t)(index + i) * zone_size;
+        ret = qcow2_co_pwrite_zeroes(bs, zone_start,
+                                     MIN(zone_size, capacity - zone_start), 0);
         if (ret < 0) {
             error_report("Failed to clear zone data at zone %u",
                          index + i);
@@ -5678,7 +5689,7 @@ qcow2_reset_zone(BlockDriverState *bs, uint32_t index,
         qemu_co_mutex_unlock(&s->lock);
 
         uint64_t old_wp = *wp_i;
-        *wp_i = (uint64_t)(index + i) * zone_size;
+        *wp_i = zone_start;
         ret = qcow2_rw_wp_at(bs, wp_i, index + i, true);
         if (ret < 0) {
             /* Keep the in-memory write pointer consistent with the on-disk value. */
