@@ -863,13 +863,18 @@ qcow2_read_extensions(BlockDriverState *bs, uint64_t start_offset,
                 be32_to_cpu(zoned_ext.max_append_bytes);
             zoned_ext.zonedmeta_offset =
                 be64_to_cpu(zoned_ext.zonedmeta_offset);
-            s->zoned_header = zoned_ext;
 
-            /* validate the header first */
+            /*
+             * Validate the header before it becomes the driver state.
+             * qcow2_check_zone_options() also clamps the zone resource
+             * limits, so the driver has to pick up the checked copy.
+             */
             if (!qcow2_check_zone_options(&zoned_ext)) {
                 error_setg(errp, "Invalid zoned extension header");
                 return -EINVAL;
             }
+            s->zoned_header = zoned_ext;
+
             /*
              * refuse to open broken images: reject untrusted total_sectors
              * that would overflow when converted to bytes, then verify
