@@ -538,9 +538,11 @@ typedef struct ZoneCmdData {
 static uint32_t virtio_blk_max_append_sectors(VirtIOBlock *s)
 {
     BlockDriverState *bs = blk_bs(s->blk);
-    uint64_t sectors;
+    uint64_t bytes, sectors;
 
-    sectors = MIN_NON_ZERO(bs->bl.zone_size >> BDRV_SECTOR_BITS,
+    bytes = MIN_NON_ZERO(bs->bl.zone_capacity, bs->bl.zone_size);
+
+    sectors = MIN_NON_ZERO(bytes >> BDRV_SECTOR_BITS,
                            bs->bl.max_append_sectors);
 
     return MIN_NON_ZERO(sectors, BDRV_REQUEST_MAX_SECTORS);
