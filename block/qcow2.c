@@ -5572,7 +5572,7 @@ qcow2_finish_zone(BlockDriverState *bs, uint32_t index)
     qemu_co_mutex_unlock(&s->lock);
 
     uint64_t old_wp = *wp;
-    *wp = ((uint64_t)index + 1) * s->zoned_header.zone_size;
+    *wp = bdrv_zone_writable_end(bs, index);
     ret = qcow2_rw_wp_at(bs, wp, index, true);
     if (ret < 0) {
         /* Keep the in-memory write pointer consistent with the on-disk value. */
