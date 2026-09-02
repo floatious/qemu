@@ -230,7 +230,7 @@ static inline BlockZoneState qcow2_get_zone_state(BlockDriverState *bs,
     if (zone_wp == zone_start) {
         return BLK_ZS_EMPTY;
     }
-    if (zone_wp >= zone_start + bs->bl.zone_capacity) {
+    if (bdrv_zone_is_full(bs, index)) {
         return BLK_ZS_FULL;
     }
     if (zone_wp > zone_start) {
