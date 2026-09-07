@@ -2238,8 +2238,9 @@ static void test_ncq_lba_range(void)
 #define ZONED_QCOW2_OPTS "size=128M,zone.size=32M,zone.capacity=32M"
 
 /*
- * Create a temporary host-managed zoned qcow2 image (sequential zones), with
- * the image size and zone geometry/limits given as qemu-img options in @opts.
+ * Create a temporary host-managed zoned qcow2 image (sequential zones, unless
+ * @opts says otherwise), with the image size and zone geometry/limits given as
+ * qemu-img options in @opts.
  * Returns the image path (caller unlinks/frees), or NULL if a suitable
  * qemu-img is unavailable.
  */
@@ -2263,9 +2264,9 @@ static char *create_zoned_qcow2(const char *opts)
     g_assert(fd >= 0);
     close(fd);
 
-    cli = g_strdup_printf("%s create -f qcow2 %s -o %s "
+    cli = g_strdup_printf("%s create -f qcow2 %s "
                           "-o zone.mode=host-managed "
-                          "-o zone.conventional_zones=0",
+                          "-o zone.conventional_zones=0 -o %s",
                           rpath, img_path, opts);
     ok = g_spawn_command_line_sync(cli, NULL, NULL, &rc, &err) &&
          g_spawn_check_exit_status(rc, &err);
@@ -2288,6 +2289,37 @@ static void zac_report_zones(AHCIQState *ahci, uint8_t port, uint64_t locator,
     ahci_io(ahci, port, CMD_ZAC_MGMT_IN, buffer, 512, locator);
 }
 
+/* Issue a ZAC MANAGEMENT OUT zone-management action on a single zone. */
+/* ZAC MANAGEMENT OUT actions, and the ALL bit of the FEATURE field */
+enum {
+    ZAC_CLOSE_ZONE  = 0x01,
+    ZAC_FINISH_ZONE = 0x02,
+    ZAC_OPEN_ZONE   = 0x03,
+    ZAC_RESET_ZONE  = 0x04,
+    ZAC_ALL         = 1 << 8,
+};
+
+/* ZONE CONDITION values of a REPORT ZONES descriptor */
+enum {
+    ZC_EMPTY  = 0x1,
+    ZC_EOPEN  = 0x3,
+    ZC_CLOSED = 0x4,
+    ZC_FULL   = 0xe,
+};
+
+static void zac_zone_mgmt(AHCIQState *ahci, uint8_t port, uint8_t action,
+                          uint64_t zone_lba)
+{
+    AHCICommand *cmd = ahci_command_create(CMD_ZAC_MGMT_OUT);
+
+    ahci_command_set_feature(cmd, action);
+    ahci_command_set_offset(cmd, zone_lba);
+    ahci_command_commit(ahci, cmd, port);
+    ahci_command_issue(ahci, cmd);
+    ahci_command_verify(ahci, cmd);
+    ahci_command_free(cmd);
+}
+
 /* Verify one 64-byte REPORT ZONES descriptor. */
 static void zac_check_zone(const uint8_t *desc, uint8_t type, uint8_t cond,
                            uint64_t length, uint64_t start, uint64_t wp)
@@ -2308,6 +2340,10 @@ static void test_zac_unsupported(void)
     unsigned px;
     AHCIQState *ahci = ahci_boot_with_sense_data(&px);
 
+    ahci_nodata_cmd(ahci, px, CMD_ZAC_MGMT_OUT, 0x01, 0, ATA_ERR_ABRT);
+    ahci_port_restart(ahci, px);
+    g_assert_cmphex(ahci_sense(ahci, px), ==, 0x052000);
+
     ahci_read_expect_abort(ahci, px, CMD_ZAC_MGMT_IN, 0);
     g_assert_cmphex(ahci_sense(ahci, px), ==, 0x052000);
 
@@ -2320,6 +2356,7 @@ static void test_zac(void)
     char *img;
     uint16_t page[256];
     uint8_t *p8 = (uint8_t *)page;
+    unsigned char *tx;
     unsigned px;
     const uint64_t zone_len = (32ull * 1024 * 1024) / 512;   /* 65536 */
     const uint64_t max_lba = (128ull * 1024 * 1024) / 512 - 1;
@@ -2369,6 +2406,34 @@ static void test_zac(void)
     /* A ZONE LOCATOR beyond the maximum LBA is out of range (ZAC-2 5.2.10) */
     ahci_read_expect_abort(ahci, px, CMD_ZAC_MGMT_IN, max_lba + 1);
     g_assert_cmphex(ahci_sense(ahci, px), ==, 0x052100);
+
+    /* OPEN ZONE 0 -> reported as EXPLICITLY OPENED. */
+    zac_zone_mgmt(ahci, px, ZAC_OPEN_ZONE, 0);
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x3, zone_len, 0, 0);
+
+    /* CLOSE ZONE 0 with nothing written -> back to EMPTY. */
+    zac_zone_mgmt(ahci, px, ZAC_CLOSE_ZONE, 0);
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x1, zone_len, 0, 0);
+
+    /* Write one sector -> zone 0 is IMPLICITLY OPENED, WP advances. */
+    tx = g_malloc(512);
+    memset(tx, 0xa5, 512);
+    ahci_io(ahci, px, CMD_WRITE_DMA_EXT, tx, 512, 0);
+    g_free(tx);
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x2, zone_len, 0, 1);
+
+    /* CLOSE ZONE 0 with data written -> CLOSED (WP preserved). */
+    zac_zone_mgmt(ahci, px, ZAC_CLOSE_ZONE, 0);
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x4, zone_len, 0, 1);
+
+    /* RESET WRITE POINTER zone 0 -> reported as EMPTY again. */
+    zac_zone_mgmt(ahci, px, ZAC_RESET_ZONE, 0);
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x1, zone_len, 0, 0);
 
     ahci_shutdown(ahci);
     unlink(img);
@@ -3371,6 +3436,219 @@ static void test_sense_data_lba_range(void)
     ahci_shutdown(ahci);
 }
 
+static void zac_zone_mgmt_range(AHCIQState *ahci, unsigned px,
+                                uint16_t feature, uint16_t count,
+                                uint64_t zone_lba, uint8_t err)
+{
+    AHCICommand *cmd = ahci_command_create(CMD_ZAC_MGMT_OUT);
+
+    ahci_command_set_feature(cmd, feature);
+    ahci_command_set_count(cmd, count);
+    ahci_command_set_offset(cmd, zone_lba);
+    if (err) {
+        ahci_command_expect_error(cmd, err);
+    }
+    ahci_command_commit(ahci, cmd, px);
+    ahci_command_issue(ahci, cmd);
+    ahci_command_verify(ahci, cmd);
+    ahci_command_free(cmd);
+}
+
+static uint8_t zac_zone_cond(AHCIQState *ahci, unsigned px, uint64_t lba)
+{
+    uint8_t buf[512];
+
+    zac_report_zones(ahci, px, lba, buf);
+    return buf[65] >> 4;
+}
+
+static AHCIQState *zac_boot(const char *img, unsigned *px)
+{
+    AHCIQState *ahci;
+
+    ahci = ahci_boot_and_enable("-drive if=none,id=drive0,file=%s,format=qcow2 "
+                                "-M q35 -device ide-hd,drive=drive0,"
+                                "werror=report,rerror=report", img);
+    *px = ahci_port_select(ahci);
+    ahci_port_clear(ahci, *px);
+    return ahci;
+}
+
+/*
+ * ZAC MANAGEMENT OUT checks the zone that it is given as ZAC-2 requires
+ * (5.2.4.3.3.4), and an action that would not change the zone leaves it as it
+ * is without error (tables 24, 26, 28 and 49).
+ */
+static void test_zac_zone_mgmt(void)
+{
+    AHCIQState *ahci;
+    unsigned px;
+    char *img;
+
+    /* 16 KiB (32 sector) zones, 2048 sectors, zone 0 conventional. */
+    img = create_zoned_qcow2("size=1M,cluster_size=16K,zone.size=16K,"
+                             "zone.capacity=16K,zone.conventional_zones=1");
+    if (!img) {
+        g_test_skip("qemu-img with zoned qcow2 support is unavailable");
+        return;
+    }
+    ahci = zac_boot(img, &px);
+
+    /* Not the start of a zone, or a conventional zone: INVALID FIELD IN CDB */
+    zac_zone_mgmt_range(ahci, px, ZAC_OPEN_ZONE, 0, 32 + 8, ATA_ERR_ABRT);
+    g_assert_cmphex(ahci_sense(ahci, px), ==, 0x052400);
+    zac_zone_mgmt_range(ahci, px, ZAC_OPEN_ZONE, 0, 0, ATA_ERR_ABRT);
+    g_assert_cmphex(ahci_sense(ahci, px), ==, 0x052400);
+
+    /* Beyond the last sector: LOGICAL BLOCK ADDRESS OUT OF RANGE */
+    zac_zone_mgmt_range(ahci, px, ZAC_OPEN_ZONE, 0, 2048, ATA_ERR_ABRT);
+    g_assert_cmphex(ahci_sense(ahci, px), ==, 0x052100);
+
+    /*
+     * CLOSE ZONE of an empty zone, FINISH ZONE and OPEN ZONE of a full zone,
+     * and RESET WRITE POINTER of an empty zone succeed.
+     */
+    zac_zone_mgmt(ahci, px, ZAC_CLOSE_ZONE, 32);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 32), ==, ZC_EMPTY);
+    zac_zone_mgmt(ahci, px, ZAC_FINISH_ZONE, 32);
+    zac_zone_mgmt(ahci, px, ZAC_FINISH_ZONE, 32);
+    zac_zone_mgmt(ahci, px, ZAC_OPEN_ZONE, 32);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 32), ==, ZC_FULL);
+    zac_zone_mgmt(ahci, px, ZAC_RESET_ZONE, 64);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 64), ==, ZC_EMPTY);
+
+    ahci_shutdown(ahci);
+    unlink(img);
+    g_free(img);
+}
+
+/*
+ * A ZAC MANAGEMENT OUT action with a ZONE COUNT of two or more applies to a
+ * range of zones, and with the ALL bit set to all zones, in both cases to the
+ * zones in the conditions that ZAC-2 lists for it (tables 24, 26, 28 and 49).
+ */
+static void test_zac_zone_mgmt_range(void)
+{
+    uint8_t buf[512] = { 0 };
+    AHCIQState *ahci;
+    unsigned px;
+    char *img;
+
+    /* 64 zones of 16 KiB (32 sectors), zone 0 conventional, two open zones. */
+    img = create_zoned_qcow2("size=1M,cluster_size=16K,zone.size=16K,"
+                             "zone.capacity=16K,zone.conventional_zones=1,"
+                             "zone.max_open_zones=2");
+    if (!img) {
+        g_test_skip("qemu-img with zoned qcow2 support is unavailable");
+        return;
+    }
+    ahci = zac_boot(img, &px);
+
+    /* With the ALL bit, the ZONE COUNT must be zero: INVALID FIELD IN CDB */
+    zac_zone_mgmt_range(ahci, px, ZAC_OPEN_ZONE | ZAC_ALL, 1, 0, ATA_ERR_ABRT);
+    g_assert_cmphex(ahci_sense(ahci, px), ==, 0x052400);
+
+    /* A zone range past the last zone: LOGICAL BLOCK ADDRESS OUT OF RANGE */
+    zac_zone_mgmt_range(ahci, px, ZAC_OPEN_ZONE, 3, 62 * 32, ATA_ERR_ABRT);
+    g_assert_cmphex(ahci_sense(ahci, px), ==, 0x052100);
+
+    /* A zone range that includes the conventional zone: INVALID FIELD IN CDB */
+    zac_zone_mgmt_range(ahci, px, ZAC_OPEN_ZONE, 2, 0, ATA_ERR_ABRT);
+    g_assert_cmphex(ahci_sense(ahci, px), ==, 0x052400);
+
+    /*
+     * Opening zones 1-3 exceeds the open zone limit, so none of them is
+     * opened (INSUFFICIENT ZONE RESOURCES), but zones 1-2 can be.
+     */
+    zac_zone_mgmt_range(ahci, px, ZAC_OPEN_ZONE, 3, 32, ATA_ERR_ABRT);
+    g_assert_cmphex(ahci_sense(ahci, px), ==, 0x07550e);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 32), ==, ZC_EMPTY);
+    zac_zone_mgmt_range(ahci, px, ZAC_OPEN_ZONE, 2, 32, 0);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 32), ==, ZC_EOPEN);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 64), ==, ZC_EOPEN);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 96), ==, ZC_EMPTY);
+
+    /* Closing zones 1-3 closes the two open ones, which are empty again. */
+    zac_zone_mgmt_range(ahci, px, ZAC_CLOSE_ZONE, 3, 32, 0);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 32), ==, ZC_EMPTY);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 64), ==, ZC_EMPTY);
+
+    /* Finishing zones 1-2 finishes zone 1, which holds data, not zone 2. */
+    ahci_io(ahci, px, CMD_WRITE_DMA_EXT, buf, sizeof(buf), 32);
+    zac_zone_mgmt_range(ahci, px, ZAC_FINISH_ZONE, 2, 32, 0);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 32), ==, ZC_FULL);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 64), ==, ZC_EMPTY);
+
+    /*
+     * With the ALL bit, OPEN only opens closed zones, CLOSE closes open zones
+     * and FINISH finishes them, but none of them changes an empty zone.
+     */
+    ahci_io(ahci, px, CMD_WRITE_DMA_EXT, buf, sizeof(buf), 96);
+    zac_zone_mgmt(ahci, px, ZAC_CLOSE_ZONE, 96);
+    zac_zone_mgmt_range(ahci, px, ZAC_OPEN_ZONE | ZAC_ALL, 0, 0, 0);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 96), ==, ZC_EOPEN);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 64), ==, ZC_EMPTY);
+    zac_zone_mgmt_range(ahci, px, ZAC_CLOSE_ZONE | ZAC_ALL, 0, 0, 0);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 96), ==, ZC_CLOSED);
+    zac_zone_mgmt_range(ahci, px, ZAC_FINISH_ZONE | ZAC_ALL, 0, 0, 0);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 96), ==, ZC_FULL);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 64), ==, ZC_EMPTY);
+
+    /* Resetting zones 1-3 empties the full zones 1 and 3. */
+    zac_zone_mgmt_range(ahci, px, ZAC_RESET_ZONE, 3, 32, 0);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 32), ==, ZC_EMPTY);
+    g_assert_cmpint(zac_zone_cond(ahci, px, 96), ==, ZC_EMPTY);
+
+    ahci_shutdown(ahci);
+    unlink(img);
+    g_free(img);
+}
+
+/*
+ * Running out of zone resources, whether an explicit OPEN ZONE or a write
+ * needs to open a zone, is reported as DATA PROTECT / INSUFFICIENT ZONE
+ * RESOURCES (55h/0Eh).
+ */
+static void test_zac_zone_resources(void)
+{
+    uint8_t buf[512] = { 0 };
+    AHCIQState *ahci;
+    unsigned px;
+    char *img;
+
+    /* 16 KiB (32 sector) zones, at most one open and two active zones. */
+    img = create_zoned_qcow2("size=1M,cluster_size=16K,zone.size=16K,"
+                             "zone.capacity=16K,zone.max_open_zones=1,"
+                             "zone.max_active_zones=2");
+    if (!img) {
+        g_test_skip("qemu-img with zoned qcow2 support is unavailable");
+        return;
+    }
+    ahci = zac_boot(img, &px);
+
+    /* With zone 0 explicitly open, zone 1 can neither be opened... */
+    zac_zone_mgmt(ahci, px, ZAC_OPEN_ZONE, 0);
+    zac_zone_mgmt_range(ahci, px, ZAC_OPEN_ZONE, 0, 32, ATA_ERR_ABRT);
+    g_assert_cmphex(ahci_sense(ahci, px), ==, 0x07550e);
+    /* ...nor written to (which would open it implicitly). */
+    zac_write_expect_abort(ahci, px, 32, sizeof(buf));
+    g_assert_cmphex(ahci_sense(ahci, px), ==, 0x07550e);
+
+    /*
+     * Once zone 0 holds data and is closed, zone 1 can be opened, but then
+     * zones 0 and 1 use up both active zones, so zone 2 cannot.
+     */
+    ahci_io(ahci, px, CMD_WRITE_DMA_EXT, buf, sizeof(buf), 0);
+    zac_zone_mgmt(ahci, px, ZAC_CLOSE_ZONE, 0);
+    ahci_io(ahci, px, CMD_WRITE_DMA_EXT, buf, sizeof(buf), 32);
+    zac_write_expect_abort(ahci, px, 64, sizeof(buf));
+    g_assert_cmphex(ahci_sense(ahci, px), ==, 0x07550e);
+
+    ahci_shutdown(ahci);
+    unlink(img);
+    g_free(img);
+}
+
 int main(int argc, char **argv)
 {
     const char *arch, *base;
@@ -3510,6 +3788,9 @@ int main(int argc, char **argv)
                    test_zac_write_full_zone);
     qtest_add_func("/ahci/io/zac/ncq_error", test_ncq_cmd_error_zoned);
     qtest_add_func("/ahci/io/zac/error_policy", test_zac_error_policy);
+    qtest_add_func("/ahci/io/zac/zone_mgmt", test_zac_zone_mgmt);
+    qtest_add_func("/ahci/io/zac/zone_mgmt_range", test_zac_zone_mgmt_range);
+    qtest_add_func("/ahci/io/zac/zone_resources", test_zac_zone_resources);
     qtest_add_func("/ahci/migrate/ncq/simple", test_migrate_ncq);
     qtest_add_func("/ahci/io/ncq/retry", test_halted_ncq);
     qtest_add_func("/ahci/migrate/ncq/halted", test_migrate_halted_ncq);
