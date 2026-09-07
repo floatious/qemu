@@ -2239,6 +2239,20 @@ static void zac_report_zones(AHCIQState *ahci, uint8_t port, uint64_t locator,
     ahci_io(ahci, port, CMD_ZAC_MGMT_IN, buffer, 512, locator);
 }
 
+/* Issue a ZAC MANAGEMENT OUT zone-management action on a single zone. */
+static void zac_zone_mgmt(AHCIQState *ahci, uint8_t port, uint8_t action,
+                          uint64_t zone_lba)
+{
+    AHCICommand *cmd = ahci_command_create(CMD_ZAC_MGMT_OUT);
+
+    ahci_command_set_feature(cmd, action);
+    ahci_command_set_offset(cmd, zone_lba);
+    ahci_command_commit(ahci, cmd, port);
+    ahci_command_issue(ahci, cmd);
+    ahci_command_verify(ahci, cmd);
+    ahci_command_free(cmd);
+}
+
 /* Verify one 64-byte REPORT ZONES descriptor. */
 static void zac_check_zone(const uint8_t *desc, uint8_t type, uint8_t cond,
                            uint64_t length, uint64_t start, uint64_t wp)
@@ -2285,6 +2299,10 @@ static void test_zac_unsupported(void)
     unsigned px;
     AHCIQState *ahci = ahci_boot_with_sense_data(&px);
 
+    ahci_nodata_cmd(ahci, px, CMD_ZAC_MGMT_OUT, 0x01, 0, ATA_ERR_ABRT);
+    ahci_port_restart(ahci, px);
+    g_assert_cmphex(ahci_sense(ahci, px), ==, 0x052000);
+
     ahci_read_expect_abort(ahci, px, CMD_ZAC_MGMT_IN, 0);
     g_assert_cmphex(ahci_sense(ahci, px), ==, 0x052000);
 
@@ -2297,6 +2315,7 @@ static void test_zac(void)
     char *img;
     uint16_t page[256];
     uint8_t *p8 = (uint8_t *)page;
+    unsigned char *tx;
     unsigned px;
     const uint64_t zone_len = (32ull * 1024 * 1024) / 512;   /* 65536 */
     const uint64_t max_lba = (128ull * 1024 * 1024) / 512 - 1;
@@ -2346,6 +2365,34 @@ static void test_zac(void)
     /* A ZONE LOCATOR beyond the maximum LBA is out of range (ZAC-3 5.2.10) */
     ahci_read_expect_abort(ahci, px, CMD_ZAC_MGMT_IN, max_lba + 1);
     g_assert_cmphex(ahci_sense(ahci, px), ==, 0x052100);
+
+    /* OPEN ZONE 0 -> reported as EXPLICITLY OPENED. */
+    zac_zone_mgmt(ahci, px, 0x03, 0);
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x3, zone_len, 0, 0);
+
+    /* CLOSE ZONE 0 with nothing written -> back to EMPTY. */
+    zac_zone_mgmt(ahci, px, 0x01, 0);
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x1, zone_len, 0, 0);
+
+    /* Write one sector -> zone 0 is IMPLICITLY OPENED, WP advances. */
+    tx = g_malloc(512);
+    memset(tx, 0xa5, 512);
+    ahci_io(ahci, px, CMD_WRITE_DMA_EXT, tx, 512, 0);
+    g_free(tx);
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x2, zone_len, 0, 1);
+
+    /* CLOSE ZONE 0 with data written -> CLOSED (WP preserved). */
+    zac_zone_mgmt(ahci, px, 0x01, 0);
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x4, zone_len, 0, 1);
+
+    /* RESET WRITE POINTER zone 0 -> reported as EMPTY again. */
+    zac_zone_mgmt(ahci, px, 0x04, 0);
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x1, zone_len, 0, 0);
 
     ahci_shutdown(ahci);
     unlink(img);
