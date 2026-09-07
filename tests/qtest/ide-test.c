@@ -100,6 +100,8 @@ enum {
     CMD_WRITE       = 0x30,  /* WRITE SECTOR(S) */
     CMD_DIAGNOSE    = 0x90,
     CMD_INIT_DP     = 0x91,  /* INITIALIZE DEVICE PARAMETERS */
+    CMD_ZAC_MGMT_IN = 0x4a,  /* ZAC MANAGEMENT IN */
+    CMD_ZAC_MGMT_OUT = 0x9f, /* ZAC MANAGEMENT OUT */
     CMD_READ_DMA    = 0xc8,
     CMD_WRITE_DMA   = 0xca,
     CMD_READ_LOG_DMA = 0x47, /* READ LOG DMA EXT */
@@ -942,6 +944,197 @@ static void test_sense_data(void)
 
     ide_test_quit(qts);
     free_pci_device(dev);
+}
+
+/*
+ * Create a temporary host-managed zoned qcow2 image (sequential zones, unless
+ * @opts says otherwise), with the image size and zone geometry/limits given as
+ * qemu-img options in @opts.
+ */
+static char *create_zoned_qcow2(const char *opts)
+{
+    const char *qemu_img = getenv("QTEST_QEMU_IMG");
+    char *rpath, *img_path, *cli;
+    int fd, rc;
+    bool ok;
+    GError *err = NULL;
+
+    if (!qemu_img) {
+        return NULL;
+    }
+    rpath = realpath(qemu_img, NULL);
+    if (!rpath) {
+        return NULL;
+    }
+
+    fd = g_file_open_tmp("qtest-ide-zoned.XXXXXX", &img_path, NULL);
+    g_assert(fd >= 0);
+    close(fd);
+
+    cli = g_strdup_printf("%s create -f qcow2 %s "
+                          "-o zone.mode=host-managed "
+                          "-o zone.conventional_zones=0 -o %s",
+                          rpath, img_path, opts);
+    ok = g_spawn_command_line_sync(cli, NULL, NULL, &rc, &err) &&
+         g_spawn_check_exit_status(rc, &err);
+    g_free(cli);
+    free(rpath);
+
+    if (!ok) {
+        g_clear_error(&err);
+        unlink(img_path);
+        g_free(img_path);
+        return NULL;
+    }
+    return img_path;
+}
+
+/*
+ * A write that misses the write pointer of a sequential zone is reported, with
+ * the Sense Data Reporting feature set enabled, as ILLEGAL REQUEST / UNALIGNED
+ * WRITE COMMAND rather than without sense data.
+ */
+static void test_sense_data_zoned(void)
+{
+    QTestState *qts;
+    QPCIDevice *dev;
+    QPCIBar bmdma_bar, ide_bar;
+    uint8_t status, sk, asc, ascq;
+    uintptr_t guest_buf;
+    PrdtEntry prdt[1];
+    char *img;
+
+    img = create_zoned_qcow2("size=128M,zone.size=32M,zone.capacity=32M");
+    if (!img) {
+        g_test_skip("qemu-img with zoned qcow2 support is unavailable");
+        return;
+    }
+
+    qts = ide_test_start("-drive file=%s,if=ide,format=qcow2", img);
+    qtest_irq_intercept_in(qts, "ioapic");
+    dev = get_pci_device(qts, &bmdma_bar, &ide_bar);
+
+    /* Enable the Sense Data Reporting feature set. */
+    qpci_io_writeb(dev, ide_bar, reg_device, 0);
+    qpci_io_writeb(dev, ide_bar, reg_feature, 0xc3);
+    qpci_io_writeb(dev, ide_bar, reg_nsectors, 0x01);
+    qpci_io_writeb(dev, ide_bar, reg_command, CMD_SET_FEATURES);
+    status = ide_wait_not_busy(dev, ide_bar);
+    assert_bit_clear(status, ERR);
+
+    /*
+     * WRITE DMA off the write pointer: zone 0 is sequential with WP at 0, so
+     * a write to LBA 8 must be rejected.
+     */
+    guest_buf = guest_alloc(&guest_malloc, 512);
+    prdt[0].addr = cpu_to_le32(guest_buf);
+    prdt[0].size = cpu_to_le32(512 | PRDT_EOT);
+    send_dma_request(qts, CMD_WRITE_DMA, 8, 1, prdt, ARRAY_SIZE(prdt), NULL);
+
+    status = qpci_io_readb(dev, ide_bar, reg_status);
+    assert_bit_set(status, ERR | SENSE_DATA);
+    assert_bit_set(qpci_io_readb(dev, ide_bar, reg_error), ABRT);
+
+    /* REQUEST SENSE DATA EXT reports UNALIGNED WRITE COMMAND (21h/04h). */
+    qpci_io_writeb(dev, ide_bar, reg_command, CMD_REQ_SENSE_DATA);
+    status = ide_wait_not_busy(dev, ide_bar);
+    assert_bit_set(status, SENSE_DATA);
+    ascq = qpci_io_readb(dev, ide_bar, reg_lba_low);
+    asc = qpci_io_readb(dev, ide_bar, reg_lba_middle);
+    sk = qpci_io_readb(dev, ide_bar, reg_lba_high) & 0x0f;
+    g_assert_cmphex(sk, ==, 0x05);  /* ILLEGAL REQUEST */
+    g_assert_cmphex(asc, ==, 0x21);
+    g_assert_cmphex(ascq, ==, 0x04);
+
+    ide_test_quit(qts);
+    free_pci_device(dev);
+    unlink(img);
+    g_free(img);
+}
+
+/* Enable the Sense Data Reporting feature set (SET FEATURES C3h). */
+static void ide_enable_sense_data(QPCIDevice *dev, QPCIBar ide_bar)
+{
+    qpci_io_writeb(dev, ide_bar, reg_device, 0);
+    qpci_io_writeb(dev, ide_bar, reg_feature, 0xc3);
+    qpci_io_writeb(dev, ide_bar, reg_nsectors, 0x01);
+    qpci_io_writeb(dev, ide_bar, reg_command, CMD_SET_FEATURES);
+    assert_bit_clear(ide_wait_not_busy(dev, ide_bar), ERR);
+}
+
+/*
+ * Check that the last command was aborted with sense data available, and that
+ * REQUEST SENSE DATA EXT reports the expected sense key, ASC and ASCQ.
+ */
+static void ide_check_sense(QPCIDevice *dev, QPCIBar ide_bar, uint8_t sk,
+                            uint8_t asc, uint8_t ascq)
+{
+    uint8_t status = qpci_io_readb(dev, ide_bar, reg_status);
+
+    assert_bit_set(status, ERR | SENSE_DATA);
+    assert_bit_set(qpci_io_readb(dev, ide_bar, reg_error), ABRT);
+
+    qpci_io_writeb(dev, ide_bar, reg_command, CMD_REQ_SENSE_DATA);
+    status = ide_wait_not_busy(dev, ide_bar);
+    assert_bit_set(status, SENSE_DATA);
+    g_assert_cmphex(qpci_io_readb(dev, ide_bar, reg_lba_high) & 0x0f, ==, sk);
+    g_assert_cmphex(qpci_io_readb(dev, ide_bar, reg_lba_middle), ==, asc);
+    g_assert_cmphex(qpci_io_readb(dev, ide_bar, reg_lba_low), ==, ascq);
+}
+
+/* ZAC MANAGEMENT OUT actions */
+enum {
+    ZAC_CLOSE_ZONE  = 0x01,
+    ZAC_FINISH_ZONE = 0x02,
+    ZAC_OPEN_ZONE   = 0x03,
+    ZAC_RESET_ZONE  = 0x04,
+};
+
+/* Zone conditions, as reported by REPORT ZONES EXT */
+enum {
+    ZC_EMPTY    = 0x1,
+    ZC_EOPEN    = 0x3,
+    ZC_CLOSED   = 0x4,
+    ZC_FULL     = 0xe,
+};
+
+/*
+ * A write that crosses the end of a sequential zone is reported as ILLEGAL
+ * REQUEST / WRITE BOUNDARY VIOLATION (21h/05h).
+ */
+static void test_sense_data_zoned_boundary(void)
+{
+    QTestState *qts;
+    QPCIDevice *dev;
+    QPCIBar bmdma_bar, ide_bar;
+    uintptr_t guest_buf;
+    PrdtEntry prdt[1];
+    char *img;
+
+    /* 16 KiB (32 sector) zones, so that a small write can cross a zone. */
+    img = create_zoned_qcow2("size=1M,cluster_size=16K,zone.size=16K,"
+                             "zone.capacity=16K");
+    if (!img) {
+        g_test_skip("qemu-img with zoned qcow2 support is unavailable");
+        return;
+    }
+
+    qts = ide_test_start("-drive file=%s,if=ide,format=qcow2", img);
+    qtest_irq_intercept_in(qts, "ioapic");
+    dev = get_pci_device(qts, &bmdma_bar, &ide_bar);
+    ide_enable_sense_data(dev, ide_bar);
+
+    /* 64 sectors at the write pointer of zone 0 run into zone 1. */
+    guest_buf = guest_alloc(&guest_malloc, 64 * 512);
+    prdt[0].addr = cpu_to_le32(guest_buf);
+    prdt[0].size = cpu_to_le32((64 * 512) | PRDT_EOT);
+    send_dma_request(qts, CMD_WRITE_DMA, 0, 64, prdt, ARRAY_SIZE(prdt), NULL);
+    ide_check_sense(dev, ide_bar, 0x05, 0x21, 0x05); /* ILLEGAL REQUEST */
+
+    ide_test_quit(qts);
+    free_pci_device(dev);
+    unlink(img);
+    g_free(img);
 }
 
 /*
@@ -2187,6 +2380,9 @@ int main(int argc, char **argv)
 
     qtest_add_func("/ide/identify", test_identify);
     qtest_add_func("/ide/sense_data", test_sense_data);
+    qtest_add_func("/ide/sense_data/zoned", test_sense_data_zoned);
+    qtest_add_func("/ide/sense_data/zoned/boundary",
+                   test_sense_data_zoned_boundary);
     qtest_add_func("/ide/sense_data/lba_range", test_sense_data_lba_range);
 
     qtest_add_func("/ide/diagnostic", test_diagnostic);

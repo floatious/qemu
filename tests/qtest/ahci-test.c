@@ -2352,6 +2352,243 @@ static void test_zac(void)
     g_free(img);
 }
 
+/* Issue a WRITE DMA EXT of @size bytes at @sector that is expected to fail. */
+static void zac_write_expect_abort(AHCIQState *ahci, uint8_t port,
+                                   uint64_t sector, size_t size)
+{
+    AHCICommand *cmd;
+    uint64_t ptr;
+
+    ptr = ahci_alloc(ahci, size);
+    g_assert(ptr);
+
+    cmd = ahci_command_create(CMD_WRITE_DMA_EXT);
+    ahci_command_set_buffer(cmd, ptr);
+    ahci_command_set_size(cmd, size);
+    ahci_command_set_offset(cmd, sector);
+    ahci_command_expect_error(cmd, ATA_ERR_ABRT);
+    ahci_command_commit(ahci, cmd, port);
+    ahci_command_issue(ahci, cmd);
+    ahci_command_verify(ahci, cmd);
+    ahci_command_free(cmd);
+
+    ahci_free(ahci, ptr);
+}
+
+/*
+ * A sequential-write-required zone only accepts writes at its write pointer;
+ * a write anywhere else must be aborted.
+ */
+static void test_zac_seq_write(void)
+{
+    AHCIQState *ahci;
+    char *img;
+    uint16_t page[256];
+    uint8_t *p8 = (uint8_t *)page;
+    unsigned char *tx;
+    unsigned px;
+    const uint64_t zone_len = (32ull * 1024 * 1024) / 512;
+
+    img = create_zoned_qcow2(ZONED_QCOW2_OPTS);
+    if (!img) {
+        g_test_skip("qemu-img with zoned qcow2 support is unavailable");
+        return;
+    }
+
+    /* werror=report ensures a write error is reported rather than stopping. */
+    ahci = ahci_boot_and_enable("-drive if=none,id=drive0,file=%s,format=qcow2 "
+                                "-M q35 -device ide-hd,drive=drive0,"
+                                "werror=report,rerror=report", img);
+    px = ahci_port_select(ahci);
+    ahci_port_clear(ahci, px);
+
+    /* Zone 0 is sequential-write-required, initially EMPTY with WP at 0. */
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x1, zone_len, 0, 0);
+
+    /* A write at the write pointer (LBA 0) succeeds and advances the WP. */
+    tx = g_malloc(512);
+    memset(tx, 0xa5, 512);
+    ahci_io(ahci, px, CMD_WRITE_DMA_EXT, tx, 512, 0);
+    g_free(tx);
+
+    /* The zone is now IMPLICITLY OPENED with the WP one sector ahead. */
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x2, zone_len, 0, 1);
+
+    /* A write that is not at the write pointer (LBA 0, WP now 1) is aborted. */
+    zac_write_expect_abort(ahci, px, 0, 512);
+
+    /* The rejected write left the write pointer untouched. */
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x2, zone_len, 0, 1);
+
+    ahci_shutdown(ahci);
+    unlink(img);
+    g_free(img);
+}
+
+/*
+ * A write that starts in a full sequential zone is aborted with ILLEGAL
+ * REQUEST / INVALID FIELD IN CDB, not UNALIGNED WRITE COMMAND: a full zone
+ * has no write pointer (ZAC-3 4.7.3.2.2.1).
+ */
+static void test_zac_write_full_zone(void)
+{
+    const size_t zone_bytes = 1024 * 1024;
+    unsigned char *tx;
+    AHCIQState *ahci;
+    unsigned px;
+    char *img;
+
+    img = create_zoned_qcow2("size=4M,zone.size=1M,zone.capacity=1M");
+    if (!img) {
+        g_test_skip("qemu-img with zoned qcow2 support is unavailable");
+        return;
+    }
+
+    ahci = ahci_boot_and_enable("-drive if=none,id=drive0,file=%s,format=qcow2 "
+                                "-M q35 -device ide-hd,drive=drive0,"
+                                "werror=report,rerror=report", img);
+    px = ahci_port_select(ahci);
+    ahci_port_clear(ahci, px);
+
+    /* Writing all of zone 0 makes it full */
+    tx = g_malloc0(zone_bytes);
+    ahci_io(ahci, px, CMD_WRITE_DMA_EXT, tx, zone_bytes, 0);
+    g_free(tx);
+
+    zac_write_expect_abort(ahci, px, 0, 512);
+    g_assert_cmphex(ahci_sense(ahci, px), ==, 0x052400);
+
+    ahci_shutdown(ahci);
+    unlink(img);
+    g_free(img);
+}
+
+/*
+ * On a zoned device, the NCQ Command Error log (10h) is two pages long, and a
+ * WRITE FPDMA QUEUED off the write pointer of a sequential zone is reported in
+ * it as ILLEGAL REQUEST / UNALIGNED WRITE COMMAND.
+ */
+static void test_ncq_cmd_error_zoned(void)
+{
+    AHCIQState *ahci;
+    AHCICommand *cmd;
+    uint16_t dir[256];
+    uint8_t *log;
+    uint64_t ptr;
+    unsigned px;
+    unsigned int sum = 0;
+    int i;
+    char *img = create_zoned_qcow2(ZONED_QCOW2_OPTS);
+
+    if (!img) {
+        g_test_skip("qemu-img with zoned qcow2 support is unavailable");
+        return;
+    }
+
+    ahci = ahci_boot_and_enable("-drive if=none,id=drive0,file=%s,format=qcow2 "
+                                "-M q35 -device ide-hd,drive=drive0,"
+                                "werror=report,rerror=report", img);
+    px = ahci_port_select(ahci);
+    ahci_port_clear(ahci, px);
+
+    /* The NCQ Command Error log (10h) is advertised, 2 pages on a zoned dev. */
+    ahci_io(ahci, px, CMD_READ_LOG_DMA_EXT, dir, 512, 0x00);
+    g_assert_cmphex(le16_to_cpu(dir[0x10]), ==, 2);
+
+    /* An NCQ write off the write pointer (zone 0 is sequential, WP at 0). */
+    ptr = ahci_alloc(ahci, 512);
+    g_assert(ptr);
+    cmd = ahci_command_create(WRITE_FPDMA_QUEUED);
+    ahci_command_set_buffer(cmd, ptr);
+    ahci_command_set_size(cmd, 512);
+    ahci_command_set_offset(cmd, 8); /* LBA 8 != write pointer 0 */
+    ahci_command_expect_error(cmd, ATA_ERR_ABRT);
+    ahci_command_commit(ahci, cmd, px);
+    ahci_command_issue(ahci, cmd);
+    ahci_command_verify(ahci, cmd);
+    ahci_command_free(cmd);
+    ahci_free(ahci, ptr);
+
+    /* Read the NCQ Command Error log; page 0 records the failure. */
+    log = g_malloc0(512);
+    ahci_io(ahci, px, CMD_READ_LOG_DMA_EXT, log, 512, 0x10);
+
+    g_assert_cmphex(log[0] & (1 << 7), ==, 0); /* NQ=0: NCQ tag is valid */
+    g_assert_cmphex(log[2], ==, 0x43);         /* STATUS: DRDY | SENSE | ERR */
+    g_assert_cmphex(log[3], ==, 0x04);         /* ERROR: ABRT */
+    /* NCQ Autosense: ILLEGAL REQUEST / UNALIGNED WRITE COMMAND (21h/04h). */
+    g_assert_cmphex(log[14], ==, 0x05);
+    g_assert_cmphex(log[15], ==, 0x21);
+    g_assert_cmphex(log[16], ==, 0x04);
+    for (i = 0; i < 512; i++) {
+        sum += log[i];
+    }
+    g_assert_cmphex(sum & 0xff, ==, 0);        /* checksum: bytes sum to zero */
+
+    g_free(log);
+    ahci_shutdown(ahci);
+    unlink(img);
+    g_free(img);
+}
+
+/*
+ * Zone errors are reported to the guest even with rerror/werror=stop: they
+ * are the deterministic result of the request, so stopping the VM would only
+ * make the request fail the same way again when it is retried on resume.
+ */
+static void test_zac_error_policy(void)
+{
+    AHCIQState *ahci;
+    AHCICommand *cmd;
+    QDict *rsp;
+    uint64_t ptr;
+    unsigned px;
+    char *img;
+
+    /* 16 KiB (32 sector) zones, so that a small write can cross a zone. */
+    img = create_zoned_qcow2("size=1M,cluster_size=16K,zone.size=16K,"
+                             "zone.capacity=16K");
+    if (!img) {
+        g_test_skip("qemu-img with zoned qcow2 support is unavailable");
+        return;
+    }
+
+    ahci = ahci_boot_and_enable("-drive if=none,id=drive0,file=%s,format=qcow2 "
+                                "-M q35 -device ide-hd,drive=drive0,"
+                                "werror=stop,rerror=stop", img);
+    px = ahci_port_select(ahci);
+    ahci_port_clear(ahci, px);
+
+    /* A write at the write pointer of zone 0 that runs into zone 1. */
+    zac_write_expect_abort(ahci, px, 0, 64 * 512);
+
+    /* An NCQ write that is not at the write pointer of zone 0. */
+    ptr = ahci_alloc(ahci, 512);
+    g_assert(ptr);
+    cmd = ahci_command_create(WRITE_FPDMA_QUEUED);
+    ahci_command_set_buffer(cmd, ptr);
+    ahci_command_set_size(cmd, 512);
+    ahci_command_set_offset(cmd, 8);
+    ahci_command_expect_error(cmd, ATA_ERR_ABRT);
+    ahci_command_commit(ahci, cmd, px);
+    ahci_command_issue(ahci, cmd);
+    ahci_command_verify(ahci, cmd);
+    ahci_command_free(cmd);
+    ahci_free(ahci, ptr);
+
+    /* Both errors were reported to the guest, and the VM is still running. */
+    rsp = qtest_qmp(ahci->parent->qts, "{'execute': 'query-status'}");
+    g_assert(qdict_get_bool(qdict_get_qdict(rsp, "return"), "running"));
+    qobject_unref(rsp);
+
+    ahci_shutdown(ahci);
+    unlink(img);
+    g_free(img);
+}
+
 static int prepare_iso(size_t size, unsigned char **buf, char **name)
 {
     g_autofree char *cdrom_path = NULL;
@@ -3219,6 +3456,11 @@ int main(int argc, char **argv)
     qtest_add_func("/ahci/io/ncq/lba_range", test_ncq_lba_range);
     qtest_add_func("/ahci/io/zac", test_zac);
     qtest_add_func("/ahci/io/zac/unsupported", test_zac_unsupported);
+    qtest_add_func("/ahci/io/zac/seq_write", test_zac_seq_write);
+    qtest_add_func("/ahci/io/zac/write_full_zone",
+                   test_zac_write_full_zone);
+    qtest_add_func("/ahci/io/zac/ncq_error", test_ncq_cmd_error_zoned);
+    qtest_add_func("/ahci/io/zac/error_policy", test_zac_error_policy);
     qtest_add_func("/ahci/migrate/ncq/simple", test_migrate_ncq);
     qtest_add_func("/ahci/io/ncq/retry", test_halted_ncq);
     qtest_add_func("/ahci/migrate/ncq/halted", test_migrate_halted_ncq);

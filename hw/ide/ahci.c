@@ -1078,13 +1078,15 @@ static void ncq_cb(void *opaque, int ret)
 
     if (ret < 0) {
         bool is_read = ncq_tfs->cmd == READ_FPDMA_QUEUED;
-        BlockErrorAction action = blk_get_error_action(ide_state->blk,
+        BlockErrorAction action = ide_is_zone_error(ide_state, -ret) ?
+                                  BLOCK_ERROR_ACTION_REPORT :
+                                  blk_get_error_action(ide_state->blk,
                                                        is_read, -ret);
         if (action == BLOCK_ERROR_ACTION_STOP) {
             ncq_tfs->halt = true;
             ide_state->bus->error_status = IDE_RETRY_HBA;
         } else if (action == BLOCK_ERROR_ACTION_REPORT) {
-            ncq_err(ncq_tfs, SENSE_CODE(NO_SENSE));
+            ncq_err(ncq_tfs, ide_sense_for_errno(ide_state, -ret));
         }
         blk_error_action(ide_state->blk, action, is_read, -ret);
     } else {
