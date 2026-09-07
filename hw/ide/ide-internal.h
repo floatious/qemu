@@ -458,6 +458,9 @@ void ide_bus_exec_cmd(IDEBus *bus, uint32_t val);
 int ide_read_log(IDEState *s, uint8_t log_address, uint16_t page,
                  uint32_t count);
 
+/* The sense data for a command that failed with error, a (positive) errno */
+SCSISense ide_sense_for_errno(IDEState *s, int error);
+
 /*
  * Record the most recent NCQ command failure, with its sense data, so that it
  * can be reported through the NCQ Command Error log (10h).
@@ -467,6 +470,12 @@ void ide_ncq_cmd_error(IDEState *s, uint8_t tag, uint64_t lba,
 
 /* Whether a command may access nb_sectors sectors from sector */
 bool ide_sect_range_ok(IDEState *s, uint64_t sector, uint64_t nb_sectors);
+
+/*
+ * Whether error (a positive errno) is a zone error, which is reported to the
+ * guest regardless of the rerror/werror policy.
+ */
+bool ide_is_zone_error(IDEState *s, int error);
 
 void ide_transfer_start(IDEState *s, uint8_t *buf, int size,
                         EndTransferFunc *end_transfer_func);

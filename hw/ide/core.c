@@ -594,6 +594,45 @@ void ide_abort_command(IDEState *s)
 }
 
 /*
+ * Map a block-layer errno to SCSI-style sense data. On a host managed zoned
+ * device, the zone errors defined in include/block/block-common.h map to their
+ * ZAC sense codes; other errors have no more specific reason, and report NO
+ * SENSE, i.e. no sense data.
+ */
+SCSISense ide_sense_for_errno(IDEState *s, int error)
+{
+    if (s->zoned == BLK_Z_HM) {
+        switch (error) {
+        case BLK_ZE_UNALIGNED_WRITE:
+            return SENSE_CODE(UNALIGNED_WRITE);
+        case BLK_ZE_BOUNDARY:
+            return SENSE_CODE(WRITE_BOUNDARY_VIOLATION);
+        case BLK_ZE_FULL:
+            return SENSE_CODE(INVALID_FIELD);
+        case BLK_ZE_OPEN_RESOURCE:
+        case BLK_ZE_ACTIVE_RESOURCE:
+            return SENSE_CODE(INSUFFICIENT_ZONE_RESOURCES);
+        }
+    }
+    return SENSE_CODE(NO_SENSE);
+}
+
+/*
+ * Zone errors (see include/block/block-common.h) are the deterministic result
+ * of the guest's request, so they are always reported to the guest, whatever
+ * the rerror/werror policy: stopping the VM would only make the request fail
+ * the same way again when it is retried on resume, and ignoring the error
+ * would hide the failure from the guest.
+ */
+bool ide_is_zone_error(IDEState *s, int error)
+{
+    return s->zoned == BLK_Z_HM &&
+           (error == BLK_ZE_UNALIGNED_WRITE || error == BLK_ZE_BOUNDARY ||
+            error == BLK_ZE_OPEN_RESOURCE || error == BLK_ZE_ACTIVE_RESOURCE ||
+            error == BLK_ZE_FULL);
+}
+
+/*
  * Record the most recent NCQ command failure so that it can be reported
  * through the NCQ Command Error log (10h) when the host reads it. Unlike the
  * Sense Data Reporting feature set, the NCQ Autosense sense data is always
@@ -958,19 +997,24 @@ void ide_dma_error(IDEState *s)
 int ide_handle_rw_error(IDEState *s, int error, int op)
 {
     bool is_read = (op & IDE_RETRY_READ) != 0;
-    BlockErrorAction action = blk_get_error_action(s->blk, is_read, error);
+    BlockErrorAction action = ide_is_zone_error(s, error) ?
+                              BLOCK_ERROR_ACTION_REPORT :
+                              blk_get_error_action(s->blk, is_read, error);
 
     if (action == BLOCK_ERROR_ACTION_STOP) {
         assert(s->bus->retry_unit == s->unit);
         s->bus->error_status = op;
     } else if (action == BLOCK_ERROR_ACTION_REPORT) {
+        SCSISense sense = is_read ? SENSE_CODE(NO_SENSE) :
+                                    ide_sense_for_errno(s, error);
+
         block_acct_failed(blk_get_stats(s->blk), &s->acct);
         if (IS_IDE_RETRY_DMA(op)) {
-            ide_dma_error(s);
+            ide_dma_error_with_sense(s, sense);
         } else if (IS_IDE_RETRY_ATAPI(op)) {
             ide_atapi_io_error(s, -error);
         } else {
-            ide_rw_error(s, SENSE_CODE(NO_SENSE));
+            ide_rw_error(s, sense);
         }
     }
     blk_error_action(s->blk, action, is_read, error);
