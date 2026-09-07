@@ -101,6 +101,7 @@ enum {
     CMD_INIT_DP     = 0x91,  /* INITIALIZE DEVICE PARAMETERS */
     CMD_READ_DMA    = 0xc8,
     CMD_WRITE_DMA   = 0xca,
+    CMD_READ_LOG_DMA = 0x47, /* READ LOG DMA EXT */
     CMD_FLUSH_CACHE = 0xe7,
     CMD_IDENTIFY    = 0xec,
     CMD_PACKET      = 0xa0,
@@ -110,6 +111,7 @@ enum {
     CMDF_ABORT      = 0x100,
     CMDF_NO_BM      = 0x200,
     CMDF_NO_WAIT    = 0x400,
+    CMDF_LBA48      = 0x800,
 };
 
 enum {
@@ -259,6 +261,7 @@ static int send_dma_request_dev(QTestState *qts, QPCIDevice *dev,
 
     switch (cmd) {
     case CMD_READ_DMA:
+    case CMD_READ_LOG_DMA:
     case CMD_PACKET:
         /* Assuming we only test data reads w/ ATAPI, otherwise we need to know
          * the SCSI command being sent in the packet, too. */
@@ -299,7 +302,17 @@ static int send_dma_request_dev(QTestState *qts, QPCIDevice *dev,
             /* trim bit */
             qpci_io_writeb(dev, ide_bar, reg_feature, 0x01);
         }
-        qpci_io_writeb(dev, ide_bar, reg_nsectors, nb_sectors);
+        if (flags & CMDF_LBA48) {
+            /*
+             * 48-bit commands latch two bytes per register: write the
+             * high-order bytes (HOB) first, then the low-order bytes.
+             */
+            qpci_io_writeb(dev, ide_bar, reg_nsectors, (nb_sectors >> 8) & 0xff);
+            qpci_io_writeb(dev, ide_bar, reg_lba_low,    (sector >> 24) & 0xff);
+            qpci_io_writeb(dev, ide_bar, reg_lba_middle, (sector >> 32) & 0xff);
+            qpci_io_writeb(dev, ide_bar, reg_lba_high,   (sector >> 40) & 0xff);
+        }
+        qpci_io_writeb(dev, ide_bar, reg_nsectors, nb_sectors & 0xff);
         qpci_io_writeb(dev, ide_bar, reg_lba_low,    sector & 0xff);
         qpci_io_writeb(dev, ide_bar, reg_lba_middle, (sector >> 8) & 0xff);
         qpci_io_writeb(dev, ide_bar, reg_lba_high,   (sector >> 16) & 0xff);
@@ -430,6 +443,98 @@ static void test_bmdma_simple_rw(void)
     free_pci_device(dev);
     g_free(buf);
     g_free(cmpbuf);
+
+    test_bmdma_teardown(qts);
+}
+
+/*
+ * Read General Purpose Logging logs over BMDMA using READ LOG DMA EXT and
+ * verify the returned contents (General Purpose Log Directory and the
+ * IDENTIFY DEVICE data log).
+ */
+static void test_bmdma_read_log(void)
+{
+    QTestState *qts;
+    QPCIDevice *dev;
+    QPCIBar bmdma_bar, ide_bar;
+    uint8_t status;
+    uint8_t *buf;
+    size_t len = 512;
+    uintptr_t guest_buf;
+    PrdtEntry prdt[1];
+
+    qts = test_bmdma_setup();
+
+    guest_buf  = guest_alloc(&guest_malloc, len);
+    prdt[0].addr = cpu_to_le32(guest_buf);
+    prdt[0].size = cpu_to_le32(len | PRDT_EOT);
+
+    dev = get_pci_device(qts, &bmdma_bar, &ide_bar);
+
+    buf = g_malloc(len);
+
+    /* General Purpose Log Directory (log address 00h). */
+    qtest_memset(qts, guest_buf, 0x00, len);
+    status = send_dma_request(qts, CMD_READ_LOG_DMA | CMDF_LBA48, 0x00, 1, prdt,
+                              ARRAY_SIZE(prdt), NULL);
+    g_assert_cmphex(status, ==, BM_STS_INTR);
+    assert_bit_clear(qpci_io_readb(dev, ide_bar, reg_status), DF | ERR);
+
+    qtest_memread(qts, guest_buf, buf, len);
+    /* word 0: General Purpose Logging Version */
+    g_assert_cmpint(buf[0] | (buf[1] << 8), ==, 0x0001);
+    /* word 30h: number of pages in the IDENTIFY DEVICE data log */
+    g_assert_cmpint(buf[0x60] | (buf[0x61] << 8), ==, 4);
+
+    /* IDENTIFY DEVICE data log (log address 30h), page 0: list of pages. */
+    qtest_memset(qts, guest_buf, 0x00, len);
+    status = send_dma_request(qts, CMD_READ_LOG_DMA | CMDF_LBA48, 0x30, 1, prdt,
+                              ARRAY_SIZE(prdt), NULL);
+    g_assert_cmphex(status, ==, BM_STS_INTR);
+    assert_bit_clear(qpci_io_readb(dev, ide_bar, reg_status), DF | ERR);
+
+    qtest_memread(qts, guest_buf, buf, len);
+    g_assert_cmpint(buf[0] | (buf[1] << 8), ==, 0x0001); /* REVISION NUMBER */
+    g_assert_cmpint(buf[8], ==, 4);                       /* number of entries */
+    g_assert_cmpint(buf[9], ==, 0x00);                    /* page 00h supported */
+    g_assert_cmpint(buf[10], ==, 0x01);                   /* page 01h supported */
+    g_assert_cmpint(buf[11], ==, 0x02);                   /* page 02h supported */
+    g_assert_cmpint(buf[12], ==, 0x03);                   /* page 03h supported */
+
+    /* IDENTIFY DEVICE data log (log address 30h), page 2: Capacity. */
+    qtest_memset(qts, guest_buf, 0x00, len);
+    status = send_dma_request(qts, CMD_READ_LOG_DMA | CMDF_LBA48,
+                              0x30 | (2 << 8), 1, prdt, ARRAY_SIZE(prdt), NULL);
+    g_assert_cmphex(status, ==, BM_STS_INTR);
+    assert_bit_clear(qpci_io_readb(dev, ide_bar, reg_status), DF | ERR);
+
+    qtest_memread(qts, guest_buf, buf, len);
+    g_assert_cmpint(buf[0] | (buf[1] << 8), ==, 0x0001); /* REVISION NUMBER */
+    g_assert_cmpint(buf[2], ==, 0x02);                    /* PAGE NUMBER */
+    g_assert_cmpint(buf[7] & (1 << 7), ==, (1 << 7));     /* header shall be one */
+    g_assert_cmpint(buf[15] & (1 << 7), ==, (1 << 7));    /* Device Capacity valid */
+    /* ACCESSIBLE CAPACITY (bits 47:0) equals the image size in sectors */
+    g_assert_cmpuint((uint64_t)buf[8] | ((uint64_t)buf[9] << 8) |
+                     ((uint64_t)buf[10] << 16) | ((uint64_t)buf[11] << 24) |
+                     ((uint64_t)buf[12] << 32) | ((uint64_t)buf[13] << 40),
+                     ==, TEST_IMAGE_SIZE / 512);
+
+    /* IDENTIFY DEVICE data log (log address 30h), page 3: Supported Caps. */
+    qtest_memset(qts, guest_buf, 0x00, len);
+    status = send_dma_request(qts, CMD_READ_LOG_DMA | CMDF_LBA48,
+                              0x30 | (3 << 8), 1, prdt, ARRAY_SIZE(prdt), NULL);
+    g_assert_cmphex(status, ==, BM_STS_INTR);
+    assert_bit_clear(qpci_io_readb(dev, ide_bar, reg_status), DF | ERR);
+
+    qtest_memread(qts, guest_buf, buf, len);
+    g_assert_cmpint(buf[0] | (buf[1] << 8), ==, 0x0001); /* REVISION NUMBER */
+    g_assert_cmpint(buf[2], ==, 0x03);                    /* PAGE NUMBER */
+    g_assert_cmpint(buf[7] & (1 << 7), ==, (1 << 7));     /* header shall be one */
+    g_assert_cmpint(buf[8] & (1 << 2), ==, (1 << 2));     /* GPL DMA supported */
+    g_assert_cmpint(buf[9] & (1 << 3), ==, (1 << 3));     /* GPL supported */
+
+    free_pci_device(dev);
+    g_free(buf);
 
     test_bmdma_teardown(qts);
 }
@@ -1922,6 +2027,7 @@ int main(int argc, char **argv)
     qtest_add_func("/ide/diagnostic", test_diagnostic);
 
     qtest_add_func("/ide/bmdma/simple_rw", test_bmdma_simple_rw);
+    qtest_add_func("/ide/bmdma/read_log", test_bmdma_read_log);
     qtest_add_func("/ide/bmdma/trim", test_bmdma_trim);
     qtest_add_func("/ide/bmdma/trim_reset", test_bmdma_trim_reset);
     qtest_add_func("/ide/bmdma/various_prdts", test_bmdma_various_prdts);

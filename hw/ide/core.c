@@ -68,7 +68,8 @@ const char *IDE_DMA_CMD_lookup[IDE_DMA__COUNT] = {
     [IDE_DMA_READ] = "DMA READ",
     [IDE_DMA_WRITE] = "DMA WRITE",
     [IDE_DMA_TRIM] = "DMA TRIM",
-    [IDE_DMA_ATAPI] = "DMA ATAPI"
+    [IDE_DMA_ATAPI] = "DMA ATAPI",
+    [IDE_DMA_READ_LOG] = "DMA READ LOG"
 };
 
 static const char *IDE_DMA_CMD_str(enum ide_dma_cmd enval)
@@ -188,8 +189,8 @@ static void ide_identify(IDEState *s)
 
     if (s->ncq_queues) {
         put_le16(p + 75, s->ncq_queues - 1);
-        /* NCQ supported */
-        put_le16(p + 76, (1 << 8));
+        /* 15=READ LOG DMA EXT equivalent to READ LOG EXT, 8=NCQ supported */
+        put_le16(p + 76, (1 << 15) | (1 << 8));
     }
 
     put_le16(p + 80, 0xf0); /* ata3 -> ata6 supported */
@@ -198,11 +199,11 @@ static void ide_identify(IDEState *s)
     put_le16(p + 82, (1 << 14) | (1 << 5) | 1);
     /* 13=flush_cache_ext,12=flush_cache,10=lba48 */
     put_le16(p + 83, (1 << 14) | (1 << 13) | (1 <<12) | (1 << 10));
-    /* 14=set to 1, 8=has WWN, 1=SMART self test, 0=SMART error logging */
+    /* 14=set to 1, 8=has WWN, 5=GPL, 1=SMART self test, 0=SMART error logging */
     if (s->wwn) {
-        put_le16(p + 84, (1 << 14) | (1 << 8) | 0);
+        put_le16(p + 84, (1 << 14) | (1 << 8) | (1 << 5) | 0);
     } else {
-        put_le16(p + 84, (1 << 14) | 0);
+        put_le16(p + 84, (1 << 14) | (1 << 5) | 0);
     }
     /* 14 = NOP supported, 5=WCACHE enabled, 0=SMART feature set enabled */
     if (blk_enable_write_cache(s->blk)) {
@@ -210,13 +211,13 @@ static void ide_identify(IDEState *s)
     } else {
         put_le16(p + 85, (1 << 14) | 1);
     }
-    /* 13=flush_cache_ext,12=flush_cache,10=lba48 */
-    put_le16(p + 86, (1 << 13) | (1 <<12) | (1 << 10));
-    /* 14=set to 1, 8=has WWN, 1=SMART self test, 0=SMART error logging */
+    /* 15=words 119-120 valid,13=flush_cache_ext,12=flush_cache,10=lba48 */
+    put_le16(p + 86, (1 << 15) | (1 << 13) | (1 <<12) | (1 << 10));
+    /* 14=set to 1, 8=has WWN, 5=GPL, 1=SMART self test, 0=SMART error logging */
     if (s->wwn) {
-        put_le16(p + 87, (1 << 14) | (1 << 8) | 0);
+        put_le16(p + 87, (1 << 14) | (1 << 8) | (1 << 5) | 0);
     } else {
-        put_le16(p + 87, (1 << 14) | 0);
+        put_le16(p + 87, (1 << 14) | (1 << 5) | 0);
     }
     put_le16(p + 88, 0x3f | (1 << 13)); /* udma5 set and supported */
     put_le16(p + 93, 1 | (1 << 14) | 0x2000);
@@ -234,6 +235,8 @@ static void ide_identify(IDEState *s)
         put_le16(p + 110, s->wwn >> 16);
         put_le16(p + 111, s->wwn);
     }
+    /* 14=set to 1, 3=READ LOG DMA EXT/WRITE LOG DMA EXT (GPL DMA) supported */
+    put_le16(p + 119, (1 << 14) | (1 << 3));
     if (dev && dev->conf.discard_granularity) {
         put_le16(p + 169, 1); /* TRIM support */
     }
@@ -1622,6 +1625,165 @@ static bool cmd_write_dma(IDEState *s, uint8_t cmd)
     return false;
 }
 
+/*
+ * Build the IDENTIFY DEVICE data log (log address 30h, ACS-7 9.11) pages
+ * [page, page + count) into the I/O buffer.  Page 00h (List of Supported
+ * pages), page 01h (a copy of the IDENTIFY DEVICE data), page 02h (Capacity)
+ * and page 03h (Supported Capabilities) are implemented; any other page is
+ * returned as zeros (ACS-7 9.11.1).
+ */
+static void ide_fill_identify_device_log(IDEState *s, uint16_t page,
+                                         uint16_t count)
+{
+    uint16_t i;
+
+    /* Ensure the cached IDENTIFY DEVICE data is up to date (clobbers io_buffer). */
+    ide_identify(s);
+    memset(s->io_buffer, 0, count * 512);
+
+    for (i = 0; i < count; i++) {
+        uint8_t *buf = s->io_buffer + i * 512;
+
+        switch (page + i) {
+        case 0x00:
+            /* List of Supported IDENTIFY DEVICE data log pages (ACS-7 9.11.2) */
+            put_le16((uint16_t *)buf, 0x0001); /* REVISION NUMBER field */
+            buf[8] = 4;                        /* number of entries that follow */
+            buf[9] = 0x00;                     /* page 00h is supported */
+            buf[10] = 0x01;                    /* page 01h is supported */
+            buf[11] = 0x02;                    /* page 02h is supported */
+            buf[12] = 0x03;                    /* page 03h is supported */
+            break;
+        case 0x01:
+            /* Copy of IDENTIFY DEVICE data, words 0..255 (ACS-7 9.11.3) */
+            memcpy(buf, s->identify_data, sizeof(s->identify_data));
+            break;
+        case 0x02:
+            /* Capacity (ACS-7 9.11.4) */
+            /* header QWord: 63=set to one, PAGE NUMBER=02h, REVISION=0001h */
+            stq_le_p(buf, (1ULL << 63) | (0x02ULL << 16) | 0x0001);
+            /* Device Capacity QWord: 63=set to one, 47:0=ACCESSIBLE CAPACITY
+             * (one greater than the maximum user-accessible LBA) */
+            stq_le_p(buf + 8, (1ULL << 63) |
+                     ((uint64_t)s->nb_sectors & 0xffffffffffffULL));
+            break;
+        case 0x03:
+            /* Supported Capabilities (ACS-7 9.11.5) */
+            /* header QWord: 63=set to one, PAGE NUMBER=03h, REVISION=0001h */
+            stq_le_p(buf, (1ULL << 63) | (0x03ULL << 16) | 0x0001);
+            /* capabilities QWord: 63=valid, 11=GPL, 2=GPL DMA (READ/WRITE
+             * LOG DMA EXT) supported */
+            stq_le_p(buf + 8, (1ULL << 63) | (1ULL << 11) | (1ULL << 2));
+            break;
+        default:
+            /* Unsupported page: returned as all zeros. */
+            break;
+        }
+    }
+}
+
+/*
+ * Fill the I/O buffer with the General Purpose Logging data requested by a
+ * READ LOG EXT / READ LOG DMA EXT command and return the number of bytes to
+ * transfer, or a negative value if the command must be aborted (ACS-7 7.25).
+ */
+static int ide_read_log(IDEState *s)
+{
+    uint8_t log_address = s->sector;
+    uint16_t page = s->lcyl | ((uint16_t)s->hob_lcyl << 8);
+    uint32_t count = s->nsector; /* LOG PAGE COUNT, in 512-byte pages */
+    uint16_t log_size;
+
+    switch (log_address) {
+    case IDE_GPL_LOG_DIRECTORY:
+        log_size = 1;
+        break;
+    case IDE_GPL_LOG_IDENTIFY_DEVICE:
+        log_size = IDE_GPL_LOG_IDENTIFY_DEVICE_LEN;
+        break;
+    default:
+        /* Log (or its associated feature set) not supported (ACS-7 7.25.5). */
+        return -1;
+    }
+
+    /*
+     * A LOG PAGE COUNT of zero is invalid, and the requested pages must lie
+     * within the log as reported by the General Purpose Log Directory
+     * (ACS-7 7.25.5).
+     */
+    if (count == 0 || page >= log_size || count > log_size - page) {
+        return -1;
+    }
+
+    switch (log_address) {
+    case IDE_GPL_LOG_DIRECTORY:
+        /* General Purpose Log Directory (ACS-7 9.2) */
+        memset(s->io_buffer, 0, count * 512);
+        /* word 0: General Purpose Logging Version */
+        put_le16((uint16_t *)s->io_buffer, 0x0001);
+        /* word N: number of log pages at log address N */
+        put_le16((uint16_t *)s->io_buffer + IDE_GPL_LOG_IDENTIFY_DEVICE,
+                 IDE_GPL_LOG_IDENTIFY_DEVICE_LEN);
+        break;
+    case IDE_GPL_LOG_IDENTIFY_DEVICE:
+        ide_fill_identify_device_log(s, page, count);
+        break;
+    }
+
+    return count * 512;
+}
+
+static void ide_read_log_dma_cb(void *opaque, int ret)
+{
+    IDEState *s = opaque;
+
+    /*
+     * The log data was generated synchronously into the I/O buffer before the
+     * transfer was started, so there is never a block I/O error to handle.
+     */
+    s->bus->dma->ops->rw_buf(s->bus->dma, 1);
+    s->status = READY_STAT | SEEK_STAT;
+    ide_bus_set_irq(s->bus);
+    ide_set_inactive(s, false);
+}
+
+/* READ LOG EXT (PIO) and READ LOG DMA EXT, both 48-bit GPL commands */
+static bool cmd_read_log(IDEState *s, uint8_t cmd)
+{
+    bool dma = (cmd == WIN_READ_LOG_DMA_EXT);
+    int size;
+
+    if (!s->blk) {
+        ide_abort_command(s);
+        return true;
+    }
+
+    /* These commands are always 48-bit; COUNT holds the LOG PAGE COUNT. */
+    ide_cmd_lba48_transform(s, 1);
+
+    trace_ide_read_log(s, s->sector, s->lcyl | ((uint16_t)s->hob_lcyl << 8),
+                       s->nsector, dma ? "dma" : "pio");
+
+    size = ide_read_log(s);
+    if (size < 0) {
+        ide_abort_command(s);
+        return true;
+    }
+
+    if (dma) {
+        s->dma_cmd = IDE_DMA_READ_LOG;
+        s->io_buffer_index = 0;
+        s->io_buffer_size = size;
+        ide_start_dma(s, ide_read_log_dma_cb);
+        return false;
+    }
+
+    s->status = READY_STAT | SEEK_STAT;
+    ide_transfer_start(s, s->io_buffer, size, ide_transfer_stop);
+    ide_bus_set_irq(s->bus);
+    return false;
+}
+
 static bool cmd_flush_cache(IDEState *s, uint8_t cmd)
 {
     ide_flush_cache(s);
@@ -2123,6 +2285,8 @@ static const struct {
     [WIN_READDMA_EXT]             = { cmd_read_dma, HD_CFA_OK },
     [WIN_READ_NATIVE_MAX_EXT]     = { cmd_read_native_max, HD_CFA_OK | SET_DSC },
     [WIN_MULTREAD_EXT]            = { cmd_read_multiple, HD_CFA_OK },
+    [WIN_READ_LOG_EXT]            = { cmd_read_log, HD_OK },
+    [WIN_READ_LOG_DMA_EXT]        = { cmd_read_log, HD_OK },
     [WIN_WRITE]                   = { cmd_write_pio, HD_CFA_OK },
     [WIN_WRITE_ONCE]              = { cmd_write_pio, HD_CFA_OK },
     [WIN_WRITE_EXT]               = { cmd_write_pio, HD_CFA_OK },

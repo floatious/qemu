@@ -1051,6 +1051,107 @@ static void test_specify(void)
     ahci_shutdown(ahci);
 }
 
+/*
+ * Exercise the General Purpose Logging feature set via READ LOG EXT (PIO) or
+ * READ LOG DMA EXT.  Reads are performed one log page at a time so the same
+ * helper can drive both the PIO and DMA variants.
+ */
+static void ahci_test_read_log(AHCIQState *ahci, uint8_t read_log_cmd)
+{
+    uint16_t id[256];
+    uint16_t dir[256];
+    uint16_t page[256];
+    uint8_t *page8 = (uint8_t *)page;
+    uint64_t nb, cap;
+    unsigned px;
+
+    px = ahci_port_select(ahci);
+    ahci_port_clear(ahci, px);
+
+    /* The device must advertise the GPL feature set (IDENTIFY word 84/87) and
+     * READ LOG DMA EXT support (word 86 bit 15 makes word 119 valid; word 119
+     * bit 3 = GPL DMA supported). */
+    ahci_io(ahci, px, CMD_IDENTIFY, &id, 512, 0);
+    g_assert_cmphex(le16_to_cpu(id[84]) & (1 << 5), ==, (1 << 5));
+    g_assert_cmphex(le16_to_cpu(id[87]) & (1 << 5), ==, (1 << 5));
+    g_assert_cmphex(le16_to_cpu(id[86]) & (1 << 15), ==, (1 << 15));
+    g_assert_cmphex(le16_to_cpu(id[119]) & (1 << 3), ==, (1 << 3));
+
+    /* General Purpose Log Directory (log address 00h, page 0). */
+    ahci_io(ahci, px, read_log_cmd, &dir, 512, 0x00);
+    /* word 0: General Purpose Logging Version */
+    g_assert_cmphex(le16_to_cpu(dir[0]), ==, 0x0001);
+    /* word 30h: number of pages in the IDENTIFY DEVICE data log */
+    g_assert_cmphex(le16_to_cpu(dir[0x30]), ==, 4);
+
+    /* IDENTIFY DEVICE data log (log address 30h), page 0: list of pages. */
+    ahci_io(ahci, px, read_log_cmd, &page, 512, 0x30);
+    g_assert_cmphex(le16_to_cpu(page[0]), ==, 0x0001); /* REVISION NUMBER */
+    g_assert_cmpint(page8[8], ==, 4);                  /* number of entries */
+    g_assert_cmpint(page8[9], ==, 0x00);               /* page 00h supported */
+    g_assert_cmpint(page8[10], ==, 0x01);              /* page 01h supported */
+    g_assert_cmpint(page8[11], ==, 0x02);              /* page 02h supported */
+    g_assert_cmpint(page8[12], ==, 0x03);              /* page 03h supported */
+
+    /* IDENTIFY DEVICE data log page 1 (page number 1): copy of IDENTIFY data. */
+    ahci_io(ahci, px, read_log_cmd, &page, 512, 0x30 | (1 << 8));
+    g_assert_cmphex(memcmp(page, id, 512), ==, 0);
+
+    /* IDENTIFY DEVICE data log page 2 (page number 2): Capacity. */
+    ahci_io(ahci, px, read_log_cmd, &page, 512, 0x30 | (2 << 8));
+    g_assert_cmphex(le16_to_cpu(page[0]), ==, 0x0001);   /* REVISION NUMBER */
+    g_assert_cmpint(page8[2], ==, 0x02);                 /* PAGE NUMBER */
+    g_assert_cmpint(page8[7] & (1 << 7), ==, (1 << 7));  /* header shall be one */
+    g_assert_cmpint(page8[15] & (1 << 7), ==, (1 << 7)); /* Device Capacity valid */
+    /* ACCESSIBLE CAPACITY (bits 47:0) must match IDENTIFY words 100..103 */
+    nb = (uint64_t)le16_to_cpu(id[100]) |
+         ((uint64_t)le16_to_cpu(id[101]) << 16) |
+         ((uint64_t)le16_to_cpu(id[102]) << 32) |
+         ((uint64_t)le16_to_cpu(id[103]) << 48);
+    cap = (uint64_t)page8[8] | ((uint64_t)page8[9] << 8) |
+          ((uint64_t)page8[10] << 16) | ((uint64_t)page8[11] << 24) |
+          ((uint64_t)page8[12] << 32) | ((uint64_t)page8[13] << 40);
+    g_assert_cmpuint(cap, ==, nb);
+
+    /* IDENTIFY DEVICE data log page 3 (page number 3): Supported Capabilities. */
+    ahci_io(ahci, px, read_log_cmd, &page, 512, 0x30 | (3 << 8));
+    g_assert_cmphex(le16_to_cpu(page[0]), ==, 0x0001);   /* REVISION NUMBER */
+    g_assert_cmpint(page8[2], ==, 0x03);                 /* PAGE NUMBER */
+    g_assert_cmpint(page8[7] & (1 << 7), ==, (1 << 7));  /* header shall be one */
+    g_assert_cmpint(page8[8] & (1 << 2), ==, (1 << 2));  /* GPL DMA supported */
+    g_assert_cmpint(page8[9] & (1 << 3), ==, (1 << 3));  /* GPL supported (bit 11) */
+}
+
+static void test_read_log_dma(void)
+{
+    AHCIQState *ahci;
+    uint16_t id[256];
+    uint16_t idlog[512]; /* two consecutive 512-byte log pages */
+    unsigned px;
+
+    ahci = ahci_boot_and_enable(NULL);
+    ahci_test_read_log(ahci, CMD_READ_LOG_DMA_EXT);
+
+    /* Also exercise a multi-page DMA transfer: both pages of log 30h at once. */
+    px = ahci_port_select(ahci);
+    ahci_port_clear(ahci, px);
+    ahci_io(ahci, px, CMD_IDENTIFY, &id, 512, 0);
+    ahci_io(ahci, px, CMD_READ_LOG_DMA_EXT, &idlog, 1024, 0x30);
+    g_assert_cmphex(le16_to_cpu(idlog[0]), ==, 0x0001);   /* page 0 header */
+    g_assert_cmphex(memcmp(&idlog[256], id, 512), ==, 0); /* page 1 == IDENTIFY */
+
+    ahci_shutdown(ahci);
+}
+
+static void test_read_log_pio(void)
+{
+    AHCIQState *ahci;
+
+    ahci = ahci_boot_and_enable(NULL);
+    ahci_test_read_log(ahci, CMD_READ_LOG_EXT);
+    ahci_shutdown(ahci);
+}
+
 /**
  * Fragmented DMA test: Perform a standard 4K DMA read/write
  * test, but make sure the physical regions are fragmented to
@@ -2377,6 +2478,8 @@ int main(int argc, char **argv)
     qtest_add_func("/ahci/hba_spec",   test_hba_spec);
     qtest_add_func("/ahci/hba_enable", test_hba_enable);
     qtest_add_func("/ahci/identify",   test_identify);
+    qtest_add_func("/ahci/io/dma/read_log", test_read_log_dma);
+    qtest_add_func("/ahci/io/pio/read_log", test_read_log_pio);
 
     for (i = MODE_BEGIN; i < NUM_MODES; i++) {
         for (j = ADDR_MODE_BEGIN; j < NUM_ADDR_MODES; j++) {

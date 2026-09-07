@@ -81,7 +81,7 @@
 /* READ STREAM DMA EXT                  0x2A */
 /* READ STREAM EXT                      0x2B */
 /* reserved                             0x2C..0x2E */
-/* READ LOG EXT                         0x2F */
+#define WIN_READ_LOG_EXT                0x2F /* 48-Bit */
 #define WIN_WRITE                       0x30 /* 28-Bit */
 #define WIN_WRITE_ONCE                  0x31 /* 28-Bit w/o retries, obsolete since ATA5 */
 /* obsolete since ATA4                  0x32..0x33 */
@@ -104,7 +104,7 @@
 /* reserved                             0x43..0x44 */
 /* WRITE UNCORRECTABLE EXT              0x45 */
 /* reserved                             0x46 */
-/* READ LOG DMA EXT                     0x47 */
+#define WIN_READ_LOG_DMA_EXT            0x47 /* 48-Bit */
 /* reserved                             0x48..0x4F */
 /* obsolete since ATA4                  0x50 */
 /* CONFIGURE STREAM                     0x51 */
@@ -206,6 +206,20 @@
 
 /* feature values for Data Set Management */
 #define DSM_TRIM                        0x01
+
+/*
+ * Log addresses for the General Purpose Logging feature set, accessed via
+ * READ LOG EXT / READ LOG DMA EXT (see ACS-7 9.1 table 222).
+ */
+#define IDE_GPL_LOG_DIRECTORY           0x00 /* General Purpose Log Directory */
+#define IDE_GPL_LOG_IDENTIFY_DEVICE     0x30 /* IDENTIFY DEVICE data log */
+
+/*
+ * Number of 512-byte pages in the IDENTIFY DEVICE data log.  Pages 00h (list
+ * of supported pages), 01h (copy of IDENTIFY DEVICE data), 02h (Capacity) and
+ * 03h (Supported Capabilities) are implemented.
+ */
+#define IDE_GPL_LOG_IDENTIFY_DEVICE_LEN 4
 
 #if (IDE_DMA_BUF_SECTORS < MAX_MULT_SECTORS)
 #error "IDE_DMA_BUF_SECTORS must be bigger or equal to MAX_MULT_SECTORS"
