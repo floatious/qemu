@@ -48,6 +48,7 @@ enum ide_dma_cmd {
     IDE_DMA_TRIM,
     IDE_DMA_ATAPI,
     IDE_DMA_READ_LOG,
+    IDE_DMA_ZAC_MGMT_IN,
     IDE_DMA__COUNT
 };
 
@@ -162,6 +163,9 @@ struct IDEState {
     uint8_t *smart_selftest_data;
     /* AHCI */
     int ncq_queues;
+    /* ZAC (Zoned ATA Commands) */
+    uint8_t zoned;          /* BLK_Z_NONE or BLK_Z_HM (host managed) */
+    uint32_t max_open_zones;
 };
 
 struct IDEDeviceClass {
