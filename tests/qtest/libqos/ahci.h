@@ -285,6 +285,7 @@ enum {
     CMD_SET_FEATURES     = 0xEF,
     CMD_REQ_SENSE_DATA   = 0x0B,
     CMD_ZAC_MGMT_IN      = 0x4A,
+    CMD_ZAC_MGMT_OUT     = 0x9F,
     CMD_PACKET         = 0xA0,
     CMD_PACKET_ID      = 0xA1,
     /* NCQ */

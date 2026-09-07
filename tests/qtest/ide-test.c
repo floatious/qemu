@@ -1099,6 +1099,66 @@ enum {
 };
 
 /*
+ * Issue a 48-bit command: write the high-order bytes (HOB) of the feature,
+ * count and LBA first, then the low-order bytes. Returns the status.
+ */
+static uint8_t ide_cmd_ext(QPCIDevice *dev, QPCIBar ide_bar, uint8_t cmd,
+                           uint16_t feature, uint16_t count, uint64_t lba)
+{
+    qpci_io_writeb(dev, ide_bar, reg_device, LBA);
+    qpci_io_writeb(dev, ide_bar, reg_feature, feature >> 8);
+    qpci_io_writeb(dev, ide_bar, reg_nsectors, count >> 8);
+    qpci_io_writeb(dev, ide_bar, reg_lba_low, (lba >> 24) & 0xff);
+    qpci_io_writeb(dev, ide_bar, reg_lba_middle, (lba >> 32) & 0xff);
+    qpci_io_writeb(dev, ide_bar, reg_lba_high, (lba >> 40) & 0xff);
+    qpci_io_writeb(dev, ide_bar, reg_feature, feature & 0xff);
+    qpci_io_writeb(dev, ide_bar, reg_nsectors, count & 0xff);
+    qpci_io_writeb(dev, ide_bar, reg_lba_low, lba & 0xff);
+    qpci_io_writeb(dev, ide_bar, reg_lba_middle, (lba >> 8) & 0xff);
+    qpci_io_writeb(dev, ide_bar, reg_lba_high, (lba >> 16) & 0xff);
+    qpci_io_writeb(dev, ide_bar, reg_command, cmd);
+    return ide_wait_not_busy(dev, ide_bar);
+}
+
+/*
+ * Apply a ZAC MANAGEMENT OUT action to the @count zones starting at the zone
+ * at @lba or, with @all, to all zones (the ALL bit is bit 8 of the feature);
+ * returns the status.
+ */
+static uint8_t ide_zac_mgmt_out_range(QPCIDevice *dev, QPCIBar ide_bar,
+                                      uint8_t action, bool all,
+                                      uint16_t count, uint64_t lba)
+{
+    return ide_cmd_ext(dev, ide_bar, CMD_ZAC_MGMT_OUT, action | all << 8,
+                       count, lba);
+}
+
+/* Apply a ZAC MANAGEMENT OUT action to the zone at @lba; returns the status. */
+static uint8_t ide_zac_mgmt_out(QPCIDevice *dev, QPCIBar ide_bar,
+                                uint8_t action, uint64_t lba)
+{
+    return ide_zac_mgmt_out_range(dev, ide_bar, action, false, 0, lba);
+}
+
+/* The condition of the zone at @lba, from a one page REPORT ZONES EXT. */
+static uint8_t ide_zone_condition(QPCIDevice *dev, QPCIBar ide_bar,
+                                  uint64_t lba)
+{
+    uint16_t page[256];
+    uint8_t status;
+    int i;
+
+    status = ide_cmd_ext(dev, ide_bar, CMD_ZAC_MGMT_IN, 0x00, 1, lba);
+    assert_bit_clear(status, ERR);
+    for (i = 0; i < 256; i++) {
+        assert_bit_set(qpci_io_readb(dev, ide_bar, reg_status), DRQ);
+        page[i] = qpci_io_readw(dev, ide_bar, reg_data);
+    }
+    /* The ZONE CONDITION of the first zone descriptor, in byte 65 */
+    return page[32] >> 12;
+}
+
+/*
  * A write that crosses the end of a sequential zone is reported as ILLEGAL
  * REQUEST / WRITE BOUNDARY VIOLATION (21h/05h).
  */
@@ -1130,6 +1190,214 @@ static void test_sense_data_zoned_boundary(void)
     prdt[0].size = cpu_to_le32((64 * 512) | PRDT_EOT);
     send_dma_request(qts, CMD_WRITE_DMA, 0, 64, prdt, ARRAY_SIZE(prdt), NULL);
     ide_check_sense(dev, ide_bar, 0x05, 0x21, 0x05); /* ILLEGAL REQUEST */
+
+    ide_test_quit(qts);
+    free_pci_device(dev);
+    unlink(img);
+    g_free(img);
+}
+
+/*
+ * Running out of zone resources, whether an explicit OPEN ZONE or a write
+ * needs to open a zone, is reported as DATA PROTECT / INSUFFICIENT ZONE
+ * RESOURCES (55h/0Eh).
+ */
+static void test_sense_data_zoned_resources(void)
+{
+    QTestState *qts;
+    QPCIDevice *dev;
+    QPCIBar bmdma_bar, ide_bar;
+    uintptr_t guest_buf;
+    PrdtEntry prdt[1];
+    char *img;
+
+    /* 16 KiB (32 sector) zones, at most one open and two active zones. */
+    img = create_zoned_qcow2("size=1M,cluster_size=16K,zone.size=16K,"
+                             "zone.capacity=16K,zone.max_open_zones=1,"
+                             "zone.max_active_zones=2");
+    if (!img) {
+        g_test_skip("qemu-img with zoned qcow2 support is unavailable");
+        return;
+    }
+
+    qts = ide_test_start("-drive file=%s,if=ide,format=qcow2", img);
+    qtest_irq_intercept_in(qts, "ioapic");
+    dev = get_pci_device(qts, &bmdma_bar, &ide_bar);
+    ide_enable_sense_data(dev, ide_bar);
+
+    guest_buf = guest_alloc(&guest_malloc, 512);
+    prdt[0].addr = cpu_to_le32(guest_buf);
+    prdt[0].size = cpu_to_le32(512 | PRDT_EOT);
+
+    /* With zone 0 explicitly open, zone 1 can neither be opened... */
+    assert_bit_clear(ide_zac_mgmt_out(dev, ide_bar, ZAC_OPEN_ZONE, 0), ERR);
+    ide_zac_mgmt_out(dev, ide_bar, ZAC_OPEN_ZONE, 32);
+    ide_check_sense(dev, ide_bar, 0x07, 0x55, 0x0e); /* DATA PROTECT */
+
+    /* ...nor written to (which would open it implicitly). */
+    send_dma_request(qts, CMD_WRITE_DMA, 32, 1, prdt, ARRAY_SIZE(prdt), NULL);
+    ide_check_sense(dev, ide_bar, 0x07, 0x55, 0x0e);
+
+    /*
+     * Once zone 0 holds data and is closed, zone 1 can be opened, but then
+     * zones 0 and 1 use up both active zones, so zone 2 cannot.
+     */
+    send_dma_request(qts, CMD_WRITE_DMA, 0, 1, prdt, ARRAY_SIZE(prdt), NULL);
+    assert_bit_clear(qpci_io_readb(dev, ide_bar, reg_status), ERR);
+    assert_bit_clear(ide_zac_mgmt_out(dev, ide_bar, ZAC_CLOSE_ZONE, 0), ERR);
+    send_dma_request(qts, CMD_WRITE_DMA, 32, 1, prdt, ARRAY_SIZE(prdt), NULL);
+    assert_bit_clear(qpci_io_readb(dev, ide_bar, reg_status), ERR);
+    send_dma_request(qts, CMD_WRITE_DMA, 64, 1, prdt, ARRAY_SIZE(prdt), NULL);
+    ide_check_sense(dev, ide_bar, 0x07, 0x55, 0x0e);
+
+    ide_test_quit(qts);
+    free_pci_device(dev);
+    unlink(img);
+    g_free(img);
+}
+
+/*
+ * ZAC MANAGEMENT OUT checks the zone that it is given as ZAC-3 requires
+ * (5.2.4.3.3.4), and an action that would not change the zone leaves it as it
+ * is without error (tables 25, 27, 29 and 51).
+ */
+static void test_sense_data_zoned_mgmt(void)
+{
+    QTestState *qts;
+    QPCIDevice *dev;
+    QPCIBar bmdma_bar, ide_bar;
+    char *img;
+
+    /* 16 KiB (32 sector) zones, 2048 sectors, zone 0 conventional. */
+    img = create_zoned_qcow2("size=1M,cluster_size=16K,zone.size=16K,"
+                             "zone.capacity=16K,zone.conventional_zones=1");
+    if (!img) {
+        g_test_skip("qemu-img with zoned qcow2 support is unavailable");
+        return;
+    }
+
+    qts = ide_test_start("-drive file=%s,if=ide,format=qcow2", img);
+    qtest_irq_intercept_in(qts, "ioapic");
+    dev = get_pci_device(qts, &bmdma_bar, &ide_bar);
+    ide_enable_sense_data(dev, ide_bar);
+
+    /* Not the start of a zone, or a conventional zone: INVALID FIELD IN CDB */
+    ide_zac_mgmt_out(dev, ide_bar, ZAC_OPEN_ZONE, 32 + 8);
+    ide_check_sense(dev, ide_bar, 0x05, 0x24, 0x00);
+    ide_zac_mgmt_out(dev, ide_bar, ZAC_OPEN_ZONE, 0);
+    ide_check_sense(dev, ide_bar, 0x05, 0x24, 0x00);
+
+    /* Beyond the last sector: LOGICAL BLOCK ADDRESS OUT OF RANGE */
+    ide_zac_mgmt_out(dev, ide_bar, ZAC_OPEN_ZONE, 2048);
+    ide_check_sense(dev, ide_bar, 0x05, 0x21, 0x00);
+
+    /*
+     * CLOSE ZONE of an empty zone, FINISH ZONE and OPEN ZONE of a full zone,
+     * and RESET WRITE POINTER of an empty zone succeed.
+     */
+    assert_bit_clear(ide_zac_mgmt_out(dev, ide_bar, ZAC_CLOSE_ZONE, 32), ERR);
+    assert_bit_clear(ide_zac_mgmt_out(dev, ide_bar, ZAC_FINISH_ZONE, 32), ERR);
+    assert_bit_clear(ide_zac_mgmt_out(dev, ide_bar, ZAC_FINISH_ZONE, 32), ERR);
+    assert_bit_clear(ide_zac_mgmt_out(dev, ide_bar, ZAC_OPEN_ZONE, 32), ERR);
+    assert_bit_clear(ide_zac_mgmt_out(dev, ide_bar, ZAC_RESET_ZONE, 64), ERR);
+
+    ide_test_quit(qts);
+    free_pci_device(dev);
+    unlink(img);
+    g_free(img);
+}
+
+/*
+ * A ZAC MANAGEMENT OUT action with a ZONE COUNT of two or more applies to a
+ * range of zones, and with the ALL bit set to all zones, in both cases to the
+ * zones in the conditions that ZAC-3 lists for it (tables 25, 27, 29 and 51).
+ */
+static void test_sense_data_zoned_mgmt_range(void)
+{
+    QTestState *qts;
+    QPCIDevice *dev;
+    QPCIBar bmdma_bar, ide_bar;
+    uintptr_t guest_buf;
+    PrdtEntry prdt[1];
+    char *img;
+
+    /* 64 zones of 16 KiB (32 sectors), zone 0 conventional, two open zones. */
+    img = create_zoned_qcow2("size=1M,cluster_size=16K,zone.size=16K,"
+                             "zone.capacity=16K,zone.conventional_zones=1,"
+                             "zone.max_open_zones=2");
+    if (!img) {
+        g_test_skip("qemu-img with zoned qcow2 support is unavailable");
+        return;
+    }
+
+    qts = ide_test_start("-drive file=%s,if=ide,format=qcow2", img);
+    qtest_irq_intercept_in(qts, "ioapic");
+    dev = get_pci_device(qts, &bmdma_bar, &ide_bar);
+    ide_enable_sense_data(dev, ide_bar);
+
+    guest_buf = guest_alloc(&guest_malloc, 512);
+    prdt[0].addr = cpu_to_le32(guest_buf);
+    prdt[0].size = cpu_to_le32(512 | PRDT_EOT);
+
+    /* With the ALL bit, the ZONE COUNT must be zero: INVALID FIELD IN CDB */
+    ide_zac_mgmt_out_range(dev, ide_bar, ZAC_OPEN_ZONE, true, 1, 0);
+    ide_check_sense(dev, ide_bar, 0x05, 0x24, 0x00);
+
+    /* A zone range past the last zone: LOGICAL BLOCK ADDRESS OUT OF RANGE */
+    ide_zac_mgmt_out_range(dev, ide_bar, ZAC_OPEN_ZONE, false, 3, 62 * 32);
+    ide_check_sense(dev, ide_bar, 0x05, 0x21, 0x00);
+
+    /*
+     * Opening zones 1-3 exceeds the open zone limit, so none of them is
+     * opened (INSUFFICIENT ZONE RESOURCES), but zones 1-2 can be.
+     */
+    ide_zac_mgmt_out_range(dev, ide_bar, ZAC_OPEN_ZONE, false, 3, 32);
+    ide_check_sense(dev, ide_bar, 0x07, 0x55, 0x0e);
+    g_assert_cmpint(ide_zone_condition(dev, ide_bar, 32), ==, ZC_EMPTY);
+    assert_bit_clear(ide_zac_mgmt_out_range(dev, ide_bar, ZAC_OPEN_ZONE,
+                                            false, 2, 32), ERR);
+    g_assert_cmpint(ide_zone_condition(dev, ide_bar, 32), ==, ZC_EOPEN);
+    g_assert_cmpint(ide_zone_condition(dev, ide_bar, 64), ==, ZC_EOPEN);
+    g_assert_cmpint(ide_zone_condition(dev, ide_bar, 96), ==, ZC_EMPTY);
+
+    /* Closing zones 1-3 closes the two open ones, which are empty again. */
+    assert_bit_clear(ide_zac_mgmt_out_range(dev, ide_bar, ZAC_CLOSE_ZONE,
+                                            false, 3, 32), ERR);
+    g_assert_cmpint(ide_zone_condition(dev, ide_bar, 32), ==, ZC_EMPTY);
+    g_assert_cmpint(ide_zone_condition(dev, ide_bar, 64), ==, ZC_EMPTY);
+
+    /* Finishing zones 1-2 finishes zone 1, which holds data, not zone 2. */
+    send_dma_request(qts, CMD_WRITE_DMA, 32, 1, prdt, ARRAY_SIZE(prdt), NULL);
+    assert_bit_clear(qpci_io_readb(dev, ide_bar, reg_status), ERR);
+    assert_bit_clear(ide_zac_mgmt_out_range(dev, ide_bar, ZAC_FINISH_ZONE,
+                                            false, 2, 32), ERR);
+    g_assert_cmpint(ide_zone_condition(dev, ide_bar, 32), ==, ZC_FULL);
+    g_assert_cmpint(ide_zone_condition(dev, ide_bar, 64), ==, ZC_EMPTY);
+
+    /*
+     * With the ALL bit, OPEN only opens closed zones, CLOSE closes open zones
+     * and FINISH finishes them, but none of them changes an empty zone.
+     */
+    send_dma_request(qts, CMD_WRITE_DMA, 96, 1, prdt, ARRAY_SIZE(prdt), NULL);
+    assert_bit_clear(qpci_io_readb(dev, ide_bar, reg_status), ERR);
+    assert_bit_clear(ide_zac_mgmt_out(dev, ide_bar, ZAC_CLOSE_ZONE, 96), ERR);
+    assert_bit_clear(ide_zac_mgmt_out_range(dev, ide_bar, ZAC_OPEN_ZONE,
+                                            true, 0, 0), ERR);
+    g_assert_cmpint(ide_zone_condition(dev, ide_bar, 96), ==, ZC_EOPEN);
+    g_assert_cmpint(ide_zone_condition(dev, ide_bar, 64), ==, ZC_EMPTY);
+    assert_bit_clear(ide_zac_mgmt_out_range(dev, ide_bar, ZAC_CLOSE_ZONE,
+                                            true, 0, 0), ERR);
+    g_assert_cmpint(ide_zone_condition(dev, ide_bar, 96), ==, ZC_CLOSED);
+    assert_bit_clear(ide_zac_mgmt_out_range(dev, ide_bar, ZAC_FINISH_ZONE,
+                                            true, 0, 0), ERR);
+    g_assert_cmpint(ide_zone_condition(dev, ide_bar, 96), ==, ZC_FULL);
+    g_assert_cmpint(ide_zone_condition(dev, ide_bar, 64), ==, ZC_EMPTY);
+
+    /* Resetting zones 1-3 empties the full zones 1 and 3. */
+    assert_bit_clear(ide_zac_mgmt_out_range(dev, ide_bar, ZAC_RESET_ZONE,
+                                            false, 3, 32), ERR);
+    g_assert_cmpint(ide_zone_condition(dev, ide_bar, 32), ==, ZC_EMPTY);
+    g_assert_cmpint(ide_zone_condition(dev, ide_bar, 96), ==, ZC_EMPTY);
 
     ide_test_quit(qts);
     free_pci_device(dev);
@@ -2383,6 +2651,12 @@ int main(int argc, char **argv)
     qtest_add_func("/ide/sense_data/zoned", test_sense_data_zoned);
     qtest_add_func("/ide/sense_data/zoned/boundary",
                    test_sense_data_zoned_boundary);
+    qtest_add_func("/ide/sense_data/zoned/resources",
+                   test_sense_data_zoned_resources);
+    qtest_add_func("/ide/sense_data/zoned/zone_mgmt",
+                   test_sense_data_zoned_mgmt);
+    qtest_add_func("/ide/sense_data/zoned/zone_mgmt_range",
+                   test_sense_data_zoned_mgmt_range);
     qtest_add_func("/ide/sense_data/lba_range", test_sense_data_lba_range);
 
     qtest_add_func("/ide/diagnostic", test_diagnostic);

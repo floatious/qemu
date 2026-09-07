@@ -75,6 +75,7 @@ AHCICommandProp ahci_command_properties[] = {
     { .cmd = CMD_REQ_SENSE_DATA, .lba48 = true },
     { .cmd = CMD_ZAC_MGMT_IN,    .data = true,  .pio = true,
                                  .lba48 = true, .read = true },
+    { .cmd = CMD_ZAC_MGMT_OUT,   .lba48 = true },
     { .cmd = READ_FPDMA_QUEUED,  .data = true,  .dma = true,
                                  .lba48 = true, .read = true, .ncq = true },
     { .cmd = WRITE_FPDMA_QUEUED, .data = true,  .dma = true,

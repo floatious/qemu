@@ -1774,6 +1774,265 @@ static bool cmd_zac_management_in(IDEState *s, uint8_t cmd)
     return false;
 }
 
+/*
+ * Check the zone that a ZAC MANAGEMENT OUT action for a single zone applies
+ * to, as ZAC-3 requires (5.2.4.3.3.4; ZBC-3 5.1.2 for SCSI). If the zone is
+ * valid, return true with its condition in @state; otherwise abort the command
+ * and return false.
+ */
+static bool ide_zac_check_zone(IDEState *s, int64_t zone_id,
+                               BlockZoneState *state)
+{
+    BlockZoneDescriptor zone;
+    unsigned int nr_zones = 1;
+
+    if (zone_id >= s->nb_sectors) {
+        ide_abort_command_with_sense(s, SENSE_CODE(LBA_OUT_OF_RANGE));
+        return false;
+    }
+
+    if (zone_id * 512 % blk_get_zone_size(s->blk) == 0) {
+        if (blk_zone_report(s->blk, zone_id * 512, &nr_zones, &zone) < 0 ||
+            nr_zones != 1) {
+            ide_abort_command(s);
+            return false;
+        }
+        if (zone.type != BLK_ZT_CONV) {
+            *state = zone.state;
+            return true;
+        }
+    }
+
+    /* Not the start of a zone, or a conventional zone: INVALID FIELD IN CDB */
+    ide_abort_command_with_sense(s, SENSE_CODE(INVALID_FIELD));
+    return false;
+}
+
+/*
+ * Whether a ZAC MANAGEMENT OUT action for a single zone leaves a zone with
+ * Zone Condition @state as it is, without error (ZAC-3 tables 25, 27, 29 and
+ * 51; ZBC-3 tables 23, 25, 27 and 48 for SCSI).
+ */
+static bool ide_zac_zone_unchanged(BlockZoneOp op, BlockZoneState state)
+{
+    switch (op) {
+    case BLK_ZO_CLOSE:
+        return state == BLK_ZS_EMPTY || state == BLK_ZS_CLOSED ||
+               state == BLK_ZS_FULL;
+    case BLK_ZO_FINISH:
+        return state == BLK_ZS_FULL;
+    case BLK_ZO_OPEN:
+        return state == BLK_ZS_EOPEN || state == BLK_ZS_FULL;
+    case BLK_ZO_RESET:
+        return state == BLK_ZS_EMPTY;
+    default:
+        return false;
+    }
+}
+
+/*
+ * Whether a ZAC MANAGEMENT OUT action for a zone range of two or more zones,
+ * or with @all for all zones, applies to a zone with Zone Condition @state;
+ * zones in other conditions are left as they are (ZAC-3 tables 25, 27, 29 and
+ * 51).
+ */
+static bool ide_zac_range_applies(BlockZoneOp op, BlockZoneState state,
+                                  bool all)
+{
+    switch (op) {
+    case BLK_ZO_CLOSE:
+        return state == BLK_ZS_IOPEN || state == BLK_ZS_EOPEN;
+    case BLK_ZO_FINISH:
+        return state == BLK_ZS_IOPEN || state == BLK_ZS_EOPEN ||
+               state == BLK_ZS_CLOSED;
+    case BLK_ZO_OPEN:
+        return state == BLK_ZS_CLOSED ||
+               (!all && (state == BLK_ZS_EMPTY || state == BLK_ZS_IOPEN));
+    case BLK_ZO_RESET:
+        return state == BLK_ZS_IOPEN || state == BLK_ZS_EOPEN ||
+               state == BLK_ZS_CLOSED || state == BLK_ZS_FULL;
+    default:
+        return false;
+    }
+}
+
+#define IDE_ZAC_ZONES_PER_REPORT 64
+
+/*
+ * Apply a ZAC MANAGEMENT OUT action to the zone range of @nr zones that starts
+ * at zone @first or, with @all, to all zones. The whole zone range is checked
+ * before any zone is changed. On error, abort the command.
+ */
+static void ide_zac_mgmt_zones(IDEState *s, BlockZoneOp op, uint64_t first,
+                               uint64_t nr, bool all)
+{
+    BlockZoneDescriptor zones[IDE_ZAC_ZONES_PER_REPORT];
+    uint64_t zone_size = blk_get_zone_size(s->blk);
+    uint64_t capacity = s->nb_sectors * 512;
+    uint32_t max_open = blk_get_max_open_zones(s->blk);
+    uint64_t nr_open = 0;
+    int pass, ret;
+
+    for (pass = 0; pass < 2; pass++) {
+        uint64_t done;
+
+        for (done = 0; done < nr; ) {
+            unsigned int n = MIN(nr - done, IDE_ZAC_ZONES_PER_REPORT);
+            unsigned int i;
+
+            ret = blk_zone_report(s->blk, (first + done) * zone_size, &n,
+                                  zones);
+            if (ret < 0 || !n) {
+                ide_abort_command(s);
+                return;
+            }
+            for (i = 0; i < n; i++) {
+                BlockZoneDescriptor *z = &zones[i];
+
+                if (pass == 0) {
+                    /* A zone range must not include a conventional zone */
+                    if (!all && z->type == BLK_ZT_CONV) {
+                        ide_abort_command_with_sense(
+                            s, SENSE_CODE(INVALID_FIELD));
+                        return;
+                    }
+                    if (op == BLK_ZO_OPEN && (z->state == BLK_ZS_EOPEN ||
+                        ide_zac_range_applies(op, z->state, all))) {
+                        nr_open++;
+                    }
+                } else if (ide_zac_range_applies(op, z->state, all)) {
+                    ret = blk_zone_mgmt(s->blk, op, z->start,
+                                        MIN(z->length, capacity - z->start));
+                    if (ret < 0) {
+                        ide_abort_command_with_sense(
+                            s, ide_sense_for_errno(s, -ret));
+                        return;
+                    }
+                }
+            }
+            done += n;
+        }
+
+        /*
+         * An OPEN ZONE EXT that would leave more zones explicitly open than
+         * the open zone limit allows fails without opening any (5.2.7.3.2).
+         */
+        if (pass == 0 && max_open && nr_open > max_open) {
+            ide_abort_command_with_sense(
+                s, SENSE_CODE(INSUFFICIENT_ZONE_RESOURCES));
+            return;
+        }
+    }
+}
+
+/*
+ * ZAC Management Out (9Fh, Non-Data)
+ *
+ * Register mapping (48-bit command):
+ *   FEATURE[4:0]  = ZM_ACTION (01h CLOSE, 02h FINISH, 03h OPEN,
+ *                              04h RESET WRITE POINTER)
+ *   HOB_FEATURE[0] = ALL bit
+ *   LBA[47:0]     = ZONE ID
+ */
+static bool cmd_zac_management_out(IDEState *s, uint8_t cmd)
+{
+    uint8_t zm_action, all_bit;
+    uint16_t zone_count;
+    uint64_t zone_size, nr_zones;
+    int64_t zone_id, len;
+    BlockZoneOp op;
+    int ret;
+
+    if (!s->blk || s->zoned != BLK_Z_HM) {
+        /* Only a host managed zoned device supports the ZAC commands */
+        ide_abort_command_with_sense(s, SENSE_CODE(INVALID_OPCODE));
+        return true;
+    }
+
+    zm_action = s->feature & 0x1f;
+    all_bit = s->hob_feature & 0x01;
+    zone_count = ((uint16_t)s->hob_nsector << 8) | s->nsector;
+    zone_size = blk_get_zone_size(s->blk);
+    nr_zones = DIV_ROUND_UP(s->nb_sectors * 512, zone_size);
+
+    s->lba48 = 1;
+    zone_id = ide_get_sector(s);
+
+    switch (zm_action) {
+    case 0x01: /* CLOSE ZONE EXT */
+        op = BLK_ZO_CLOSE;
+        break;
+    case 0x02: /* FINISH ZONE EXT */
+        op = BLK_ZO_FINISH;
+        break;
+    case 0x03: /* OPEN ZONE EXT */
+        op = BLK_ZO_OPEN;
+        break;
+    case 0x04: /* RESET WRITE POINTER EXT */
+        op = BLK_ZO_RESET;
+        break;
+    default:
+        ide_abort_command_with_sense(s, SENSE_CODE(INVALID_FIELD));
+        return true;
+    }
+
+    if (all_bit) {
+        /* With the ALL bit set, the ZONE COUNT must be zero (5.2.4.3.2) */
+        if (zone_count) {
+            ide_abort_command_with_sense(s, SENSE_CODE(INVALID_FIELD));
+            return true;
+        }
+        if (op != BLK_ZO_RESET) {
+            ide_zac_mgmt_zones(s, op, 0, nr_zones, true);
+            return true;
+        }
+        /* Reset all zones at once */
+        len = s->nb_sectors * 512;
+        zone_id = 0;
+    } else {
+        uint64_t capacity = s->nb_sectors * 512;
+        BlockZoneState state;
+
+        if (!ide_zac_check_zone(s, zone_id, &state)) {
+            return true;
+        }
+
+        if (zone_count > 1) {
+            uint64_t first = zone_id * 512 / zone_size;
+
+            /* A zone range must not extend past the last zone (5.2.4.3.3.4) */
+            if (first + zone_count > nr_zones) {
+                ide_abort_command_with_sense(s, SENSE_CODE(LBA_OUT_OF_RANGE));
+                return true;
+            }
+            ide_zac_mgmt_zones(s, op, first, zone_count, false);
+            return true;
+        }
+
+        if (ide_zac_zone_unchanged(op, state)) {
+            return true;
+        }
+
+        /*
+         * Apply to the single zone starting at zone_id. The length must
+         * cover the whole zone (a RESET with len 0 would be a no-op); clamp
+         * to the remaining capacity for a possibly shorter trailing zone.
+         */
+        len = zone_size;
+        if (len > capacity - zone_id * 512) {
+            len = capacity - zone_id * 512;
+        }
+    }
+
+    ret = blk_zone_mgmt(s->blk, op, zone_id * 512, len);
+    if (ret < 0) {
+        ide_abort_command_with_sense(s, ide_sense_for_errno(s, -ret));
+        return true;
+    }
+
+    return true;
+}
+
 static bool cmd_identify(IDEState *s, uint8_t cmd)
 {
     if (s->blk && s->drive_kind != IDE_CD) {
@@ -2801,6 +3060,7 @@ static const struct {
     [WIN_SETIDLE2]                = { cmd_nop, HD_CFA_OK },
     [WIN_CHECKPOWERMODE2]         = { cmd_check_power_mode, HD_CFA_OK | SET_DSC },
     [WIN_SLEEPNOW2]               = { cmd_nop, HD_CFA_OK },
+    [WIN_ZAC_MANAGEMENT_OUT]      = { cmd_zac_management_out, HD_OK | SET_DSC },
     [WIN_PACKETCMD]               = { cmd_packet, CD_OK },
     [WIN_PIDENTIFY]               = { cmd_identify_packet, CD_OK },
     [WIN_SMART]                   = { cmd_smart, HD_CFA_OK | SET_DSC },
