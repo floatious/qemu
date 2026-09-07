@@ -107,6 +107,7 @@
 /* WRITE UNCORRECTABLE EXT              0x45 */
 /* reserved                             0x46 */
 #define WIN_READ_LOG_DMA_EXT            0x47 /* 48-Bit */
+#define WIN_ZAC_MANAGEMENT_IN           0x4A /* ZAC Management In */
 /* reserved                             0x48..0x4F */
 /* obsolete since ATA4                  0x50 */
 /* CONFIGURE STREAM                     0x51 */

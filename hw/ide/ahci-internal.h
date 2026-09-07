@@ -217,6 +217,7 @@ enum AHCIPortIRQ {
 
 #define SATA_SIGNATURE_CDROM               0xeb140101
 #define SATA_SIGNATURE_DISK                0x00000101
+#define SATA_SIGNATURE_ZAC                 0xabcd0101 /* Host Managed zoned */
 
 #define AHCI_GENERIC_HOST_CONTROL_REGS_MAX_ADDR 0x2c
 
