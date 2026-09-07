@@ -37,6 +37,8 @@
 #include "system/dma.h"
 #include "hw/block/block.h"
 #include "system/block-backend.h"
+#include "scsi/constants.h"
+#include "scsi/utils.h"
 #include "qapi/error.h"
 #include "qemu/cutils.h"
 #include "system/replay.h"
@@ -237,10 +239,14 @@ static void ide_identify(IDEState *s)
         put_le16(p + 110, s->wwn >> 16);
         put_le16(p + 111, s->wwn);
     }
-    /* 14=set to 1, 3=READ LOG DMA EXT/WRITE LOG DMA EXT (GPL DMA) supported */
-    put_le16(p + 119, (1 << 14) | (1 << 3));
-    /* 14=set to 1, 3=GPL DMA enabled */
-    put_le16(p + 120, (1 << 14) | (1 << 3));
+    /*
+     * 14=set to 1, 6=Sense Data Reporting supported,
+     * 3=READ LOG DMA EXT/WRITE LOG DMA EXT (GPL DMA) supported
+     */
+    put_le16(p + 119, (1 << 14) | (1 << 6) | (1 << 3));
+    /* 14=set to 1, 6=Sense Data Reporting enabled, 3=GPL DMA enabled */
+    put_le16(p + 120, (1 << 14) | (1 << 3) |
+             (s->sense_data_enabled ? (1 << 6) : 0));
     if (dev && dev->conf.discard_granularity) {
         put_le16(p + 169, 1); /* TRIM support */
     }
@@ -545,11 +551,41 @@ BlockAIOCB *ide_issue_trim(
     return &iocb->common;
 }
 
-void ide_abort_command(IDEState *s)
+/*
+ * Record sense data for the Sense Data Reporting feature set (ACS-7 4.25).
+ * When the feature is enabled the SENSE DATA AVAILABLE bit is reported in the
+ * STATUS field so the host can retrieve the sense with REQUEST SENSE DATA EXT.
+ * When it is disabled this is a no-op, so the ATAPI sense_key/asc are left
+ * untouched for packet devices.
+ */
+static void ide_set_sense(IDEState *s, SCSISense sense)
+{
+    /*
+     * NO SENSE means that there is no sense data to report (ACS-7 6.8.31):
+     * none is made available, and the host relies on the ERROR field.
+     */
+    if (!s->sense_data_enabled || sense.key == NO_SENSE) {
+        return;
+    }
+    s->sense_key = sense.key;
+    s->asc = sense.asc;
+    s->ascq = sense.ascq;
+    s->sense_data_avail = true;
+    s->status |= SENSE_DATA_STAT;
+}
+
+/* Abort the command, and record @sense for Sense Data Reporting */
+static void ide_abort_command_with_sense(IDEState *s, SCSISense sense)
 {
     s->status = READY_STAT | ERR_STAT;
     s->error = ABRT_ERR;
     ide_transfer_stop(s);
+    ide_set_sense(s, sense);
+}
+
+void ide_abort_command(IDEState *s)
+{
+    ide_abort_command_with_sense(s, SENSE_CODE(NO_SENSE));
 }
 
 static void ide_set_retry(IDEState *s)
@@ -1408,6 +1444,9 @@ static void ide_reset(IDEState *s, IDEResetKind kind)
     s->select = (ATA_DEV_ALWAYS_ON);
     s->status = READY_STAT | SEEK_STAT;
 
+    /* Sense data does not survive a reset (ACS-7 4.25). */
+    s->sense_data_avail = false;
+
     s->lba48 = 0;
 
     /* ATAPI specific */
@@ -1682,17 +1721,19 @@ static void ide_fill_identify_device_log(IDEState *s, uint16_t page,
             /* header QWord: 63=set to one, PAGE NUMBER=03h, REVISION=0001h */
             stq_le_p(buf, (1ULL << 63) | (0x03ULL << 16) | 0x0001);
             /*
-             * capabilities QWord: 63=valid, 11=GPL, 2=GPL DMA (READ/WRITE
-             * LOG DMA EXT) supported
+             * capabilities QWord: 63=valid, 11=GPL, 5=Sense Data Reporting,
+             * 2=GPL DMA (READ/WRITE LOG DMA EXT) supported
              */
-            stq_le_p(buf + 8, (1ULL << 63) | (1ULL << 11) | (1ULL << 2));
+            stq_le_p(buf + 8, (1ULL << 63) | (1ULL << 11) |
+                     (1ULL << 5) | (1ULL << 2));
             break;
         case 0x04:
             /* Current Settings (ACS-7 9.11.6) */
             /* header QWord: 63=set to one, PAGE NUMBER=04h, REVISION=0001h */
             stq_le_p(buf, (1ULL << 63) | (0x04ULL << 16) | 0x0001);
-            /* current settings QWord: 63=valid */
-            stq_le_p(buf + 8, (1ULL << 63));
+            /* current settings QWord: 63=valid, 10=SENSE DATA ENABLED */
+            stq_le_p(buf + 8, (1ULL << 63) |
+                     (s->sense_data_enabled ? (1ULL << 10) : 0));
             break;
         default:
             /* Unsupported page: returned as all zeros. */
@@ -1806,7 +1847,7 @@ static bool cmd_read_log(IDEState *s, uint8_t cmd)
     size = ide_read_log(s, s->sector, s->lcyl | ((uint16_t)s->hob_lcyl << 8),
                         s->nsector);
     if (size < 0) {
-        ide_abort_command(s);
+        ide_abort_command_with_sense(s, SENSE_CODE(INVALID_FIELD));
         return true;
     }
 
@@ -1894,6 +1935,38 @@ static bool cmd_specify(IDEState *s, uint8_t cmd)
     return true;
 }
 
+/*
+ * REQUEST SENSE DATA EXT (0Bh), Sense Data Reporting feature set (ACS-7 7.35)
+ */
+static bool cmd_request_sense_data_ext(IDEState *s, uint8_t cmd)
+{
+    /*
+     * Return the most recent sense data in the LBA field (ACS-7 table 371):
+     * LBA 7:0 = ASCQ, LBA 15:8 = ASC, LBA 19:16 = SENSE KEY. The COUNT and
+     * upper LBA fields (progress indication / vendor specific) are zeroed.
+     */
+    s->nsector = 0;
+    s->hob_nsector = 0;
+    s->hob_sector = 0;
+    s->hob_lcyl = 0;
+    s->hob_hcyl = 0;
+
+    if (s->sense_data_avail) {
+        s->sector = s->ascq;
+        s->lcyl = s->asc;
+        s->hcyl = s->sense_key & 0x0f;
+        s->status |= SENSE_DATA_STAT;
+        /* The sense data is consumed by reading it (ACS-7 4.25). */
+        s->sense_data_avail = false;
+    } else {
+        s->sector = 0;
+        s->lcyl = 0;
+        s->hcyl = 0;
+    }
+
+    return true;
+}
+
 static bool cmd_set_features(IDEState *s, uint8_t cmd)
 {
     uint16_t *identify_data;
@@ -1923,6 +1996,17 @@ static bool cmd_set_features(IDEState *s, uint8_t cmd)
         put_le16(identify_data + 85, (1 << 14) | 1);
         ide_flush_cache(s);
         return false;
+    case 0xc3: /* enable/disable the Sense Data Reporting feature set */
+        s->sense_data_enabled = s->nsector & 0x01;
+        identify_data = (uint16_t *)s->identify_data;
+        if (s->sense_data_enabled) {
+            put_le16(identify_data + 120,
+                     le16_to_cpu(identify_data[120]) | (1 << 6));
+        } else {
+            put_le16(identify_data + 120,
+                     le16_to_cpu(identify_data[120]) & ~(1 << 6));
+        }
+        return true;
     case 0xcc: /* reverting to power-on defaults enable */
         s->reset_reverts = true;
         return true;
@@ -1975,7 +2059,7 @@ static bool cmd_set_features(IDEState *s, uint8_t cmd)
     }
 
 abort_cmd:
-    ide_abort_command(s);
+    ide_abort_command_with_sense(s, SENSE_CODE(INVALID_FIELD));
     return true;
 }
 
@@ -2318,6 +2402,7 @@ static const struct {
     [CFA_REQ_EXT_ERROR_CODE]      = { cmd_cfa_req_ext_error_code, CFA_OK },
     [WIN_DSM]                     = { cmd_data_set_management, HD_CFA_OK },
     [WIN_DEVICE_RESET]            = { cmd_device_reset, CD_OK },
+    [WIN_REQUEST_SENSE_DATA_EXT]  = { cmd_request_sense_data_ext, HD_OK },
     [WIN_RECAL]                   = { cmd_nop, HD_CFA_OK | SET_DSC},
     [WIN_READ]                    = { cmd_read_pio, ALL_OK },
     [WIN_READ_ONCE]               = { cmd_read_pio, HD_CFA_OK },
@@ -2381,6 +2466,15 @@ static bool ide_cmd_permitted(IDEState *s, uint32_t cmd)
         && (ide_cmd_table[cmd].flags & (1u << s->drive_kind));
 }
 
+/*
+ * Whether the sense data stays available once this command is accepted
+ * (ACS-7 4.25): REQUEST SENSE DATA EXT returns it.
+ */
+static bool ide_cmd_keeps_sense_data(IDEState *s, uint8_t cmd)
+{
+    return cmd == WIN_REQUEST_SENSE_DATA_EXT;
+}
+
 void ide_bus_exec_cmd(IDEBus *bus, uint32_t val)
 {
     IDEState *s;
@@ -2403,7 +2497,7 @@ void ide_bus_exec_cmd(IDEBus *bus, uint32_t val)
     }
 
     if (!ide_cmd_permitted(s, val)) {
-        ide_abort_command(s);
+        ide_abort_command_with_sense(s, SENSE_CODE(INVALID_OPCODE));
         ide_bus_set_irq(s->bus);
         return;
     }
@@ -2411,6 +2505,15 @@ void ide_bus_exec_cmd(IDEBus *bus, uint32_t val)
     s->status = READY_STAT | BUSY_STAT;
     s->error = 0;
     s->io_buffer_offset = 0;
+
+    /*
+     * Accepting a command makes the sense data unavailable, unless the command
+     * reads it (ACS-7 4.25); a failing command records fresh sense of its own
+     * below.
+     */
+    if (!ide_cmd_keeps_sense_data(s, val)) {
+        s->sense_data_avail = false;
+    }
 
     complete = ide_cmd_table[val].handler(s, val);
     if (complete) {
@@ -3241,6 +3344,27 @@ static const VMStateDescription vmstate_ide_tray_state = {
     }
 };
 
+static bool ide_sense_data_needed(void *opaque)
+{
+    IDEState *s = opaque;
+
+    return s->sense_data_enabled || s->sense_data_avail;
+}
+
+/* sense_key and asc travel with the main structure (ATAPI shares them) */
+static const VMStateDescription vmstate_ide_sense_data = {
+    .name = "ide_drive/sense_data",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = ide_sense_data_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(sense_data_enabled, IDEState),
+        VMSTATE_BOOL(sense_data_avail, IDEState),
+        VMSTATE_UINT8(ascq, IDEState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const VMStateDescription vmstate_ide_drive_pio_state = {
     .name = "ide_drive/pio_state",
     .version_id = 1,
@@ -3296,6 +3420,7 @@ const VMStateDescription vmstate_ide_drive = {
         &vmstate_ide_drive_reset_reverts,
         &vmstate_ide_tray_state,
         &vmstate_ide_atapi_gesn_state,
+        &vmstate_ide_sense_data,
         NULL
     }
 };

@@ -74,6 +74,7 @@ enum {
     DRDY    = 0x40,
     DF      = 0x20,
     DRQ     = 0x08,
+    SENSE_DATA = 0x02,  /* SENSE DATA AVAILABLE */
     ERR     = 0x01,
 };
 
@@ -102,7 +103,9 @@ enum {
     CMD_READ_DMA    = 0xc8,
     CMD_WRITE_DMA   = 0xca,
     CMD_READ_LOG_DMA = 0x47, /* READ LOG DMA EXT */
+    CMD_REQ_SENSE_DATA = 0x0b, /* REQUEST SENSE DATA EXT */
     CMD_FLUSH_CACHE = 0xe7,
+    CMD_SET_FEATURES = 0xef,
     CMD_IDENTIFY    = 0xec,
     CMD_PACKET      = 0xa0,
     CMD_IDENTIFY_PACKET = 0xa1,
@@ -853,6 +856,89 @@ static void test_identify(void)
 
     /* Write cache enabled bit */
     assert_bit_set(buf[85], 0x20);
+
+    ide_test_quit(qts);
+    free_pci_device(dev);
+}
+
+static uint8_t ide_wait_not_busy(QPCIDevice *dev, QPCIBar ide_bar)
+{
+    uint8_t status;
+
+    do {
+        status = qpci_io_readb(dev, ide_bar, reg_status);
+    } while (status & BSY);
+
+    return status;
+}
+
+static void ide_read_identify(QPCIDevice *dev, QPCIBar ide_bar, uint16_t *buf)
+{
+    int i;
+
+    qpci_io_writeb(dev, ide_bar, reg_device, 0);
+    qpci_io_writeb(dev, ide_bar, reg_command, CMD_IDENTIFY);
+    for (i = 0; i < 256; i++) {
+        assert_bit_set(qpci_io_readb(dev, ide_bar, reg_status), DRDY | DRQ);
+        buf[i] = qpci_io_readw(dev, ide_bar, reg_data);
+    }
+    assert_bit_clear(qpci_io_readb(dev, ide_bar, reg_status), BSY | DRQ);
+}
+
+static void test_sense_data(void)
+{
+    QTestState *qts;
+    QPCIDevice *dev;
+    QPCIBar bmdma_bar, ide_bar;
+    uint16_t buf[256];
+    uint8_t status, sk, asc, ascq;
+
+    qts = ide_test_start(
+        "-drive file=%s,if=ide,cache=writeback,format=raw",
+        tmp_path[0]);
+    dev = get_pci_device(qts, &bmdma_bar, &ide_bar);
+
+    /* The Sense Data Reporting feature set is supported but not yet enabled. */
+    ide_read_identify(dev, ide_bar, buf);
+    assert_bit_set(buf[119], 1 << 6);
+    assert_bit_clear(buf[120], 1 << 6);
+
+    /* SET FEATURES C3h with COUNT bit 0 set enables sense data reporting. */
+    qpci_io_writeb(dev, ide_bar, reg_device, 0);
+    qpci_io_writeb(dev, ide_bar, reg_feature, 0xc3);
+    qpci_io_writeb(dev, ide_bar, reg_nsectors, 0x01);
+    qpci_io_writeb(dev, ide_bar, reg_command, CMD_SET_FEATURES);
+    status = ide_wait_not_busy(dev, ide_bar);
+    assert_bit_clear(status, ERR);
+
+    ide_read_identify(dev, ide_bar, buf);
+    assert_bit_set(buf[120], 1 << 6);
+
+    /* Provoke an aborted command (SET FEATURES with a bad subcommand). */
+    qpci_io_writeb(dev, ide_bar, reg_feature, 0xff);
+    qpci_io_writeb(dev, ide_bar, reg_command, CMD_SET_FEATURES);
+    status = ide_wait_not_busy(dev, ide_bar);
+    /* Command aborted, and sense data is now available. */
+    assert_bit_set(status, ERR | SENSE_DATA);
+    assert_bit_set(qpci_io_readb(dev, ide_bar, reg_error), ABRT);
+
+    /* REQUEST SENSE DATA EXT returns the sense in the LBA registers. */
+    qpci_io_writeb(dev, ide_bar, reg_command, CMD_REQ_SENSE_DATA);
+    status = ide_wait_not_busy(dev, ide_bar);
+    assert_bit_clear(status, ERR);
+    assert_bit_set(status, SENSE_DATA);
+
+    ascq = qpci_io_readb(dev, ide_bar, reg_lba_low);
+    asc = qpci_io_readb(dev, ide_bar, reg_lba_middle);
+    sk = qpci_io_readb(dev, ide_bar, reg_lba_high) & 0x0f;
+    g_assert_cmphex(sk, ==, 0x05);  /* ILLEGAL REQUEST */
+    g_assert_cmphex(asc, ==, 0x24); /* INVALID FIELD IN CDB */
+    g_assert_cmphex(ascq, ==, 0x00);
+
+    /* Sense data is consumed by the read: a second request reports none. */
+    qpci_io_writeb(dev, ide_bar, reg_command, CMD_REQ_SENSE_DATA);
+    status = ide_wait_not_busy(dev, ide_bar);
+    assert_bit_clear(status, SENSE_DATA);
 
     ide_test_quit(qts);
     free_pci_device(dev);
@@ -2044,6 +2130,7 @@ int main(int argc, char **argv)
     qtest_add_func("/ide/identify/udma_atapi", test_identify_udma_atapi);
 
     qtest_add_func("/ide/identify", test_identify);
+    qtest_add_func("/ide/sense_data", test_sense_data);
 
     qtest_add_func("/ide/diagnostic", test_diagnostic);
 
