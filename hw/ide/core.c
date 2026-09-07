@@ -403,6 +403,10 @@ static void ide_set_signature(IDEState *s)
     if (s->drive_kind == IDE_CD) {
         s->lcyl = 0x14;
         s->hcyl = 0xeb;
+    } else if (s->blk && s->zoned == BLK_Z_HM) {
+        /* Host Managed zoned device signature (ZAC/ZBC): ABCDh */
+        s->lcyl = 0xcd;
+        s->hcyl = 0xab;
     } else if (s->blk) {
         s->lcyl = 0;
         s->hcyl = 0;
@@ -1467,6 +1471,232 @@ static bool cmd_data_set_management(IDEState *s, uint8_t cmd)
     return true;
 }
 
+/*
+ * ZAC Management In - REPORT ZONES EXT (4Ah, ZM_ACTION 00h)
+ *
+ * Register mapping (48-bit command):
+ *   FEATURE[4:0]  = ZM_ACTION (00h for REPORT ZONES)
+ *   COUNT[15:0]   = RETURN PAGE COUNT (number of 512-byte sectors)
+ *   LBA[47:0]     = ZONE LOCATOR
+ */
+static bool cmd_zac_management_in(IDEState *s, uint8_t cmd)
+{
+    uint8_t zm_action;
+    uint16_t return_page_count;
+    int64_t zone_start_lba;
+    uint32_t buf_size, zone_list_length;
+    unsigned int nr_zones, max_zones, i;
+    BlockZoneDescriptor *zones = NULL;
+    uint64_t max_lba;
+    uint8_t *buf;
+    int ret;
+
+    if (!s->blk) {
+        ide_abort_command(s);
+        return true;
+    }
+
+    zm_action = s->feature & 0x1f;
+    if (zm_action != 0x00) {
+        /* Only REPORT ZONES EXT (action 00h) is supported */
+        ide_abort_command(s);
+        return true;
+    }
+
+    return_page_count = ((uint16_t)s->hob_nsector << 8) | s->nsector;
+    if (return_page_count == 0) {
+        ide_abort_command(s);
+        return true;
+    }
+
+    s->lba48 = 1;
+    zone_start_lba = ide_get_sector(s);
+
+    buf_size = return_page_count * 512;
+    if (buf_size > s->io_buffer_total_len) {
+        buf_size = s->io_buffer_total_len;
+    }
+
+    /* Max zone descriptors that fit: (buf_size - 64-byte header) / 64 */
+    max_zones = (buf_size - 64) / 64;
+    if (max_zones == 0) {
+        max_zones = 1;
+    }
+
+    zones = g_new0(BlockZoneDescriptor, max_zones);
+    nr_zones = max_zones;
+
+    ret = blk_zone_report(s->blk, zone_start_lba * 512, &nr_zones, zones);
+    if (ret < 0) {
+        g_free(zones);
+        ide_abort_command(s);
+        return true;
+    }
+
+    /* Build the REPORT ZONES response in the I/O buffer. */
+    buf = s->io_buffer;
+    memset(buf, 0, buf_size);
+
+    /* Report zones header (64 bytes) */
+    /* Offset 0..3: ZONE LIST LENGTH (bytes of zone descriptors) */
+    zone_list_length = nr_zones * 64;
+    stl_le_p(&buf[0], zone_list_length);
+    /* Offset 4: bits 3:0 = SAME field (0 = zone sizes/types may differ) */
+    buf[4] = 0x00;
+    /* Offset 8..15: MAXIMUM LBA */
+    max_lba = s->nb_sectors > 0 ? s->nb_sectors - 1 : 0;
+    stq_le_p(&buf[8], max_lba);
+
+    /* Zone descriptors at offset 64, each 64 bytes */
+    for (i = 0; i < nr_zones; i++) {
+        uint8_t *desc = &buf[64 + i * 64];
+        BlockZoneDescriptor *z = &zones[i];
+        uint8_t zt, zc;
+
+        /* Map BlockZoneType to the ZAC ZONE TYPE field */
+        switch (z->type) {
+        case BLK_ZT_CONV:
+            zt = 0x1; /* CONVENTIONAL */
+            break;
+        case BLK_ZT_SWR:
+            zt = 0x2; /* SEQUENTIAL WRITE REQUIRED */
+            break;
+        case BLK_ZT_SWP:
+            zt = 0x3; /* SEQUENTIAL WRITE PREFERRED */
+            break;
+        default:
+            zt = 0x0;
+            break;
+        }
+
+        /* Map BlockZoneState to the ZAC ZONE CONDITION field */
+        switch (z->state) {
+        case BLK_ZS_NOT_WP:
+            zc = 0x0; /* NOT WRITE POINTER */
+            break;
+        case BLK_ZS_EMPTY:
+            zc = 0x1; /* EMPTY */
+            break;
+        case BLK_ZS_IOPEN:
+            zc = 0x2; /* IMPLICITLY OPENED */
+            break;
+        case BLK_ZS_EOPEN:
+            zc = 0x3; /* EXPLICITLY OPENED */
+            break;
+        case BLK_ZS_CLOSED:
+            zc = 0x4; /* CLOSED */
+            break;
+        case BLK_ZS_RDONLY:
+            zc = 0xd; /* READ ONLY */
+            break;
+        case BLK_ZS_FULL:
+            zc = 0xe; /* FULL */
+            break;
+        case BLK_ZS_OFFLINE:
+            zc = 0xf; /* OFFLINE */
+            break;
+        default:
+            zc = 0x0;
+            break;
+        }
+
+        /* Byte 0 bits 3:0 = ZONE TYPE */
+        desc[0] = zt & 0x0f;
+        /* Byte 1 bits 7:4 = ZONE CONDITION */
+        desc[1] = (zc << 4) & 0xf0;
+        /* Bytes 8..15: ZONE LENGTH (in sectors) */
+        stq_le_p(&desc[8], z->length / 512);
+        /* Bytes 16..23: ZONE START LBA */
+        stq_le_p(&desc[16], z->start / 512);
+        /* Bytes 24..31: WRITE POINTER LBA */
+        if (zc == 0x0 || zc == 0xe || zc == 0xf) {
+            /* NOT WP / FULL / OFFLINE: write pointer is invalid */
+            stq_le_p(&desc[24], (uint64_t)-1);
+        } else {
+            stq_le_p(&desc[24], z->wp / 512);
+        }
+    }
+
+    g_free(zones);
+
+    s->status = READY_STAT | SEEK_STAT;
+    ide_transfer_start(s, s->io_buffer, buf_size, ide_transfer_stop);
+    ide_bus_set_irq(s->bus);
+    return false;
+}
+
+/*
+ * ZAC Management Out (9Fh, Non-Data)
+ *
+ * Register mapping (48-bit command):
+ *   FEATURE[4:0]  = ZM_ACTION (01h CLOSE, 02h FINISH, 03h OPEN,
+ *                              04h RESET WRITE POINTER)
+ *   HOB_FEATURE[0] = ALL bit
+ *   LBA[47:0]     = ZONE ID
+ */
+static bool cmd_zac_management_out(IDEState *s, uint8_t cmd)
+{
+    uint8_t zm_action, all_bit;
+    int64_t zone_id, len;
+    BlockZoneOp op;
+    int ret;
+
+    if (!s->blk) {
+        ide_abort_command(s);
+        return true;
+    }
+
+    zm_action = s->feature & 0x1f;
+    all_bit = s->hob_feature & 0x01;
+
+    s->lba48 = 1;
+    zone_id = ide_get_sector(s);
+
+    switch (zm_action) {
+    case 0x01: /* CLOSE ZONE EXT */
+        op = BLK_ZO_CLOSE;
+        break;
+    case 0x02: /* FINISH ZONE EXT */
+        op = BLK_ZO_FINISH;
+        break;
+    case 0x03: /* OPEN ZONE EXT */
+        op = BLK_ZO_OPEN;
+        break;
+    case 0x04: /* RESET WRITE POINTER EXT */
+        op = BLK_ZO_RESET;
+        break;
+    default:
+        ide_abort_command(s);
+        return true;
+    }
+
+    if (all_bit) {
+        /* Apply to all zones */
+        len = s->nb_sectors * 512;
+        zone_id = 0;
+    } else {
+        /*
+         * Apply to the single zone starting at zone_id.  The length must
+         * cover the whole zone (a RESET with len 0 would be a no-op); clamp
+         * to the remaining capacity for a possibly shorter trailing zone.
+         */
+        uint64_t capacity = s->nb_sectors * 512;
+
+        len = blk_get_zone_size(s->blk);
+        if (len > capacity - zone_id * 512) {
+            len = capacity - zone_id * 512;
+        }
+    }
+
+    ret = blk_zone_mgmt(s->blk, op, zone_id * 512, len);
+    if (ret < 0) {
+        ide_abort_command(s);
+        return true;
+    }
+
+    return true;
+}
+
 static bool cmd_identify(IDEState *s, uint8_t cmd)
 {
     if (s->blk && s->drive_kind != IDE_CD) {
@@ -1655,6 +1885,10 @@ static void ide_fill_identify_device_log(IDEState *s, uint16_t page,
             buf[10] = 0x01;                    /* page 01h is supported */
             buf[11] = 0x02;                    /* page 02h is supported */
             buf[12] = 0x03;                    /* page 03h is supported */
+            if (s->zoned) {
+                buf[8] = 5;                    /* one more entry */
+                buf[13] = 0x09;                /* page 09h is supported */
+            }
             break;
         case 0x01:
             /* Copy of IDENTIFY DEVICE data, words 0..255 (ACS-7 9.11.3) */
@@ -1677,11 +1911,42 @@ static void ide_fill_identify_device_log(IDEState *s, uint16_t page,
              * LOG DMA EXT) supported */
             stq_le_p(buf + 8, (1ULL << 63) | (1ULL << 11) | (1ULL << 2));
             break;
+        case 0x09:
+            /* Zoned Device Information (only present on zoned devices) */
+            /* header QWord: 63=valid, PAGE NUMBER=09h, REVISION=0001h */
+            stq_le_p(buf, (1ULL << 63) | (0x09ULL << 16) | 0x0001);
+            /* Zoned device capabilities: 63=valid, 0=URSWRZ */
+            stq_le_p(buf + 8, (1ULL << 63) | (1ULL << 0));
+            /* Zoned device settings: 63=valid */
+            stq_le_p(buf + 16, (1ULL << 63));
+            /* Maximum number of open SWR zones: 63=valid */
+            stq_le_p(buf + 40, (1ULL << 63) |
+                     (s->max_open_zones ? s->max_open_zones : 0xffffffffULL));
+            /* Version information: 63=valid, ZAC version */
+            stq_le_p(buf + 48, (1ULL << 63) | 0x4c10);
+            /* Zone Activation Capabilities: 63=valid */
+            stq_le_p(buf + 56, (1ULL << 63));
+            /* Subsequent Number of Zones: 63=valid */
+            stq_le_p(buf + 64, (1ULL << 63));
+            /* Supported Zone Types: 63=valid, 2=Sequential Write Required,
+             * 0=Conventional */
+            stq_le_p(buf + 72, (1ULL << 63) | (1ULL << 2) | (1ULL << 0));
+            break;
         default:
             /* Unsupported page: returned as all zeros. */
             break;
         }
     }
+}
+
+/*
+ * Number of 512-byte pages in the IDENTIFY DEVICE data log.  Zoned devices
+ * additionally expose the Zoned Device Information page (09h), which lives at
+ * page index 9 and therefore extends the log to 10 pages.
+ */
+static uint16_t ide_identify_device_log_nr_pages(IDEState *s)
+{
+    return s->zoned ? 10 : IDE_GPL_LOG_IDENTIFY_DEVICE_LEN;
 }
 
 /*
@@ -1708,7 +1973,7 @@ int ide_read_log(IDEState *s, uint8_t log_address, uint16_t page,
         log_size = 1;
         break;
     case IDE_GPL_LOG_IDENTIFY_DEVICE:
-        log_size = IDE_GPL_LOG_IDENTIFY_DEVICE_LEN;
+        log_size = ide_identify_device_log_nr_pages(s);
         break;
     default:
         /* Log (or its associated feature set) not supported (ACS-7 7.25.5). */
@@ -1732,7 +1997,7 @@ int ide_read_log(IDEState *s, uint8_t log_address, uint16_t page,
         put_le16((uint16_t *)s->io_buffer, 0x0001);
         /* word N: number of log pages at log address N */
         put_le16((uint16_t *)s->io_buffer + IDE_GPL_LOG_IDENTIFY_DEVICE,
-                 IDE_GPL_LOG_IDENTIFY_DEVICE_LEN);
+                 ide_identify_device_log_nr_pages(s));
         if (s->ncq_queues) {
             put_le16((uint16_t *)s->io_buffer + IDE_GPL_LOG_NCQ_SEND_RECV, 1);
         }
@@ -2320,6 +2585,7 @@ static const struct {
     [WIN_VERIFY]                  = { cmd_verify, HD_CFA_OK | SET_DSC },
     [WIN_VERIFY_ONCE]             = { cmd_verify, HD_CFA_OK | SET_DSC },
     [WIN_VERIFY_EXT]              = { cmd_verify, HD_CFA_OK | SET_DSC },
+    [WIN_ZAC_MANAGEMENT_IN]       = { cmd_zac_management_in, HD_OK },
     [WIN_SEEK]                    = { cmd_seek, HD_CFA_OK | SET_DSC },
     [CFA_TRANSLATE_SECTOR]        = { cmd_cfa_translate_sector, CFA_OK },
     [WIN_DIAGNOSE]                = { cmd_exec_dev_diagnostic, ALL_OK },
@@ -2330,6 +2596,7 @@ static const struct {
     [WIN_SETIDLE2]                = { cmd_nop, HD_CFA_OK },
     [WIN_CHECKPOWERMODE2]         = { cmd_check_power_mode, HD_CFA_OK | SET_DSC },
     [WIN_SLEEPNOW2]               = { cmd_nop, HD_CFA_OK },
+    [WIN_ZAC_MANAGEMENT_OUT]      = { cmd_zac_management_out, HD_OK | SET_DSC },
     [WIN_PACKETCMD]               = { cmd_packet, CD_OK },
     [WIN_PIDENTIFY]               = { cmd_identify_packet, CD_OK },
     [WIN_SMART]                   = { cmd_smart, HD_CFA_OK | SET_DSC },
@@ -2876,6 +3143,15 @@ int ide_init_drive(IDEState *s, IDEDevice *dev, IDEDriveKind kind, Error **errp)
         pstrcpy(s->version, sizeof(s->version), dev->version);
     } else {
         pstrcpy(s->version, sizeof(s->version), QEMU_HW_VERSION);
+    }
+
+    /*
+     * Detect host-managed zoned block devices (ZAC).  The host-aware model is
+     * obsolete and is treated as a regular (non-zoned) disk.
+     */
+    if (blk_get_zone_model(s->blk) == BLK_Z_HM) {
+        s->zoned = BLK_Z_HM;
+        s->max_open_zones = blk_get_max_open_zones(s->blk);
     }
 
     ide_reset(s, IDE_RESET_HARDWARE);

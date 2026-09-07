@@ -676,6 +676,10 @@ static void ahci_reset_port(AHCIState *s, int port, IDEResetKind kind)
     if (ide_state->drive_kind == IDE_CD) {
         ahci_set_signature(d, SATA_SIGNATURE_CDROM);
         ide_state->status = SEEK_STAT | WRERR_STAT | READY_STAT;
+    } else if (ide_state->zoned == BLK_Z_HM) {
+        /* Host Managed zoned devices report a distinct signature (ACS/ZAC) */
+        ahci_set_signature(d, SATA_SIGNATURE_ZAC);
+        ide_state->status = SEEK_STAT | WRERR_STAT;
     } else {
         ahci_set_signature(d, SATA_SIGNATURE_DISK);
         ide_state->status = SEEK_STAT | WRERR_STAT;

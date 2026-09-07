@@ -282,6 +282,8 @@ enum {
     CMD_IDENTIFY       = 0xEC,
     CMD_READ_LOG_EXT     = 0x2F,
     CMD_READ_LOG_DMA_EXT = 0x47,
+    CMD_ZAC_MGMT_IN      = 0x4A,
+    CMD_ZAC_MGMT_OUT     = 0x9F,
     CMD_PACKET         = 0xA0,
     CMD_PACKET_ID      = 0xA1,
     /* NCQ */
@@ -652,6 +654,7 @@ void ahci_command_set_sizes(AHCICommand *cmd, uint64_t xbytes,
                             unsigned prd_size);
 void ahci_command_set_count(AHCICommand *cmd, uint16_t count);
 void ahci_command_set_ncq_subcmd(AHCICommand *cmd, uint8_t subcmd);
+void ahci_command_set_feature(AHCICommand *cmd, uint16_t feature);
 void ahci_command_expect_error(AHCICommand *cmd, uint8_t err);
 void ahci_command_set_acmd(AHCICommand *cmd, void *acmd);
 void ahci_command_enable_atapi_dma(AHCICommand *cmd);

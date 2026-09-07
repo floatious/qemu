@@ -105,6 +105,7 @@
 /* WRITE UNCORRECTABLE EXT              0x45 */
 /* reserved                             0x46 */
 #define WIN_READ_LOG_DMA_EXT            0x47 /* 48-Bit */
+#define WIN_ZAC_MANAGEMENT_IN           0x4A /* ZAC Management In (REPORT ZONES EXT) */
 /* reserved                             0x48..0x4F */
 /* obsolete since ATA4                  0x50 */
 /* CONFIGURE STREAM                     0x51 */
@@ -135,7 +136,8 @@
 #define WIN_CHECKPOWERMODE2             0x98 /* retired in ATA4 */
 #define WIN_SLEEPNOW2                   0x99 /* retired in ATA4 */
 /* vendor specific                      0x9A */
-/* reserved                             0x9B..0x9F */
+/* reserved                             0x9B..0x9E */
+#define WIN_ZAC_MANAGEMENT_OUT          0x9F /* ZAC Management Out (zone mgmt) */
 #define WIN_PACKETCMD                   0xA0 /* Send a packet command. */
 #define WIN_PIDENTIFY                   0xA1 /* identify ATAPI device */
 #define WIN_QUEUED_SERVICE              0xA2 /* obsolete since ACS2 */

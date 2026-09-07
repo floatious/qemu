@@ -1732,6 +1732,237 @@ static void test_ncq_read_log(void)
     ahci_shutdown(ahci);
 }
 
+/*
+ * Create a temporary host-managed zoned qcow2 image: 128 MiB with 32 MiB
+ * zones (i.e. 4 zones).  Returns the image path (caller unlinks/frees), or
+ * NULL if a suitable qemu-img is unavailable.
+ */
+static char *create_zoned_qcow2(void)
+{
+    const char *qemu_img = getenv("QTEST_QEMU_IMG");
+    char *rpath, *img_path, *cli;
+    int fd, rc;
+    bool ok;
+    GError *err = NULL;
+
+    if (!qemu_img) {
+        return NULL;
+    }
+    rpath = realpath(qemu_img, NULL);
+    if (!rpath) {
+        return NULL;
+    }
+
+    fd = g_file_open_tmp("qtest-zoned.XXXXXX", &img_path, NULL);
+    g_assert(fd >= 0);
+    close(fd);
+
+    cli = g_strdup_printf("%s create -f qcow2 %s -o size=128M "
+                          "-o zone.size=32M -o zone.capacity=32M "
+                          "-o zone.mode=host-managed "
+                          "-o zone.conventional_zones=0", rpath, img_path);
+    ok = g_spawn_command_line_sync(cli, NULL, NULL, &rc, &err) &&
+         g_spawn_check_exit_status(rc, &err);
+    g_free(cli);
+    free(rpath);
+
+    if (!ok) {
+        g_clear_error(&err);
+        unlink(img_path);
+        g_free(img_path);
+        return NULL;
+    }
+    return img_path;
+}
+
+/* Read one 512-byte REPORT ZONES page (ZAC MANAGEMENT IN) at @locator. */
+static void zac_report_zones(AHCIQState *ahci, uint8_t port, uint64_t locator,
+                             void *buffer)
+{
+    ahci_io(ahci, port, CMD_ZAC_MGMT_IN, buffer, 512, locator);
+}
+
+/* Issue a ZAC MANAGEMENT OUT zone-management action on a single zone. */
+static void zac_zone_mgmt(AHCIQState *ahci, uint8_t port, uint8_t action,
+                          uint64_t zone_lba)
+{
+    AHCICommand *cmd = ahci_command_create(CMD_ZAC_MGMT_OUT);
+
+    ahci_command_set_feature(cmd, action);
+    ahci_command_set_offset(cmd, zone_lba);
+    ahci_command_commit(ahci, cmd, port);
+    ahci_command_issue(ahci, cmd);
+    ahci_command_verify(ahci, cmd);
+    ahci_command_free(cmd);
+}
+
+/* Verify one 64-byte REPORT ZONES descriptor. */
+static void zac_check_zone(const uint8_t *desc, uint8_t type, uint8_t cond,
+                           uint64_t length, uint64_t start, uint64_t wp)
+{
+    g_assert_cmpint(desc[0] & 0x0f, ==, type);         /* ZONE TYPE */
+    g_assert_cmpint((desc[1] >> 4) & 0x0f, ==, cond);  /* ZONE CONDITION */
+    g_assert_cmpuint(ldq_le_p(&desc[8]), ==, length);  /* ZONE LENGTH */
+    g_assert_cmpuint(ldq_le_p(&desc[16]), ==, start);  /* ZONE START LBA */
+    g_assert_cmpuint(ldq_le_p(&desc[24]), ==, wp);     /* WRITE POINTER LBA */
+}
+
+static void test_zac(void)
+{
+    AHCIQState *ahci;
+    char *img;
+    uint16_t page[256];
+    uint8_t *p8 = (uint8_t *)page;
+    unsigned char *tx;
+    unsigned px;
+    const uint64_t zone_len = (32ull * 1024 * 1024) / 512;   /* 65536 */
+    const uint64_t max_lba = (128ull * 1024 * 1024) / 512 - 1;
+
+    img = create_zoned_qcow2();
+    if (!img) {
+        g_test_skip("qemu-img with zoned qcow2 support is unavailable");
+        return;
+    }
+
+    ahci = ahci_boot_and_enable("-drive if=none,id=drive0,file=%s,format=qcow2 "
+                                "-M q35 -device ide-hd,drive=drive0,"
+                                "werror=report,rerror=report", img);
+    px = ahci_port_select(ahci);
+    ahci_port_clear(ahci, px);
+
+    /* Host-managed zoned devices report a distinct ATA signature (ABCDh),
+     * without which the guest OS will not recognise the device as zoned. */
+    g_assert_cmphex(ahci_px_rreg(ahci, px, AHCI_PX_SIG), ==, 0xabcd0101);
+
+    /* Zoned devices grow the IDENTIFY DEVICE data log to 10 pages. */
+    ahci_io(ahci, px, CMD_READ_LOG_DMA_EXT, &page, 512, 0x00); /* directory */
+    g_assert_cmphex(le16_to_cpu(page[0x30]), ==, 10);
+
+    /* IDENTIFY DEVICE data log page 09h: Zoned Device Information. */
+    ahci_io(ahci, px, CMD_READ_LOG_DMA_EXT, &page, 512, 0x30 | (9 << 8));
+    g_assert_cmpint(p8[2], ==, 0x09);                  /* PAGE NUMBER */
+    g_assert_cmpint(p8[7] & (1 << 7), ==, (1 << 7));   /* header valid */
+    /* Supported Zone Types (offset 72): bit 0 Conventional, bit 2 SWR. */
+    g_assert_cmpint(p8[72] & ((1 << 2) | (1 << 0)), ==, (1 << 2) | (1 << 0));
+
+    /* REPORT ZONES: one 512-byte page holds the header plus all 4 zones. */
+    zac_report_zones(ahci, px, 0, page);
+    g_assert_cmpuint(ldl_le_p(&p8[0]), ==, 4 * 64);    /* ZONE LIST LENGTH */
+    g_assert_cmpuint(ldq_le_p(&p8[8]), ==, max_lba);   /* MAXIMUM LBA */
+    /* zone 0: Sequential Write Required, EMPTY, wp at zone start. */
+    zac_check_zone(p8 + 64, 0x2, 0x1, zone_len, 0, 0);
+    /* zone 1 starts one zone later. */
+    zac_check_zone(p8 + 128, 0x2, 0x1, zone_len, zone_len, zone_len);
+
+    /* OPEN ZONE 0 -> reported as EXPLICITLY OPENED. */
+    zac_zone_mgmt(ahci, px, 0x03, 0);
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x3, zone_len, 0, 0);
+
+    /* CLOSE ZONE 0 with nothing written -> back to EMPTY. */
+    zac_zone_mgmt(ahci, px, 0x01, 0);
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x1, zone_len, 0, 0);
+
+    /* Write one sector -> zone 0 is IMPLICITLY OPENED, WP advances. */
+    tx = g_malloc(512);
+    memset(tx, 0xa5, 512);
+    ahci_io(ahci, px, CMD_WRITE_DMA_EXT, tx, 512, 0);
+    g_free(tx);
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x2, zone_len, 0, 1);
+
+    /* CLOSE ZONE 0 with data written -> CLOSED (WP preserved). */
+    zac_zone_mgmt(ahci, px, 0x01, 0);
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x4, zone_len, 0, 1);
+
+    /* RESET WRITE POINTER zone 0 -> reported as EMPTY again. */
+    zac_zone_mgmt(ahci, px, 0x04, 0);
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x1, zone_len, 0, 0);
+
+    ahci_shutdown(ahci);
+    unlink(img);
+    g_free(img);
+}
+
+/* Issue a WRITE DMA EXT at @sector that is expected to be aborted. */
+static void zac_write_expect_abort(AHCIQState *ahci, uint8_t port,
+                                   uint64_t sector)
+{
+    AHCICommand *cmd;
+    uint64_t ptr;
+
+    ptr = ahci_alloc(ahci, 512);
+    g_assert(ptr);
+
+    cmd = ahci_command_create(CMD_WRITE_DMA_EXT);
+    ahci_command_set_buffer(cmd, ptr);
+    ahci_command_set_size(cmd, 512);
+    ahci_command_set_offset(cmd, sector);
+    ahci_command_expect_error(cmd, ATA_ERR_ABRT);
+    ahci_command_commit(ahci, cmd, port);
+    ahci_command_issue(ahci, cmd);
+    ahci_command_verify(ahci, cmd);
+    ahci_command_free(cmd);
+
+    ahci_free(ahci, ptr);
+}
+
+/*
+ * A sequential-write-required zone only accepts writes at its write pointer;
+ * a write anywhere else must be aborted.
+ */
+static void test_zac_seq_write(void)
+{
+    AHCIQState *ahci;
+    char *img;
+    uint16_t page[256];
+    uint8_t *p8 = (uint8_t *)page;
+    unsigned char *tx;
+    unsigned px;
+    const uint64_t zone_len = (32ull * 1024 * 1024) / 512;
+
+    img = create_zoned_qcow2();
+    if (!img) {
+        g_test_skip("qemu-img with zoned qcow2 support is unavailable");
+        return;
+    }
+
+    /* werror=report ensures a write error is reported rather than stopping. */
+    ahci = ahci_boot_and_enable("-drive if=none,id=drive0,file=%s,format=qcow2 "
+                                "-M q35 -device ide-hd,drive=drive0,"
+                                "werror=report,rerror=report", img);
+    px = ahci_port_select(ahci);
+    ahci_port_clear(ahci, px);
+
+    /* Zone 0 is sequential-write-required, initially EMPTY with WP at 0. */
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x1, zone_len, 0, 0);
+
+    /* A write at the write pointer (LBA 0) succeeds and advances the WP. */
+    tx = g_malloc(512);
+    memset(tx, 0xa5, 512);
+    ahci_io(ahci, px, CMD_WRITE_DMA_EXT, tx, 512, 0);
+    g_free(tx);
+
+    /* The zone is now IMPLICITLY OPENED with the WP one sector ahead. */
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x2, zone_len, 0, 1);
+
+    /* A write that is not at the write pointer (LBA 0, WP now 1) is aborted. */
+    zac_write_expect_abort(ahci, px, 0);
+
+    /* The rejected write left the write pointer untouched. */
+    zac_report_zones(ahci, px, 0, page);
+    zac_check_zone(p8 + 64, 0x2, 0x2, zone_len, 0, 1);
+
+    ahci_shutdown(ahci);
+    unlink(img);
+    g_free(img);
+}
+
 static int prepare_iso(size_t size, unsigned char **buf, char **name)
 {
     g_autofree char *cdrom_path = NULL;
@@ -2583,6 +2814,8 @@ int main(int argc, char **argv)
 
     qtest_add_func("/ahci/io/ncq/simple", test_ncq_simple);
     qtest_add_func("/ahci/io/ncq/read_log", test_ncq_read_log);
+    qtest_add_func("/ahci/io/zac", test_zac);
+    qtest_add_func("/ahci/io/zac/seq_write", test_zac_seq_write);
     qtest_add_func("/ahci/migrate/ncq/simple", test_migrate_ncq);
     qtest_add_func("/ahci/io/ncq/retry", test_halted_ncq);
     qtest_add_func("/ahci/migrate/ncq/halted", test_migrate_halted_ncq);

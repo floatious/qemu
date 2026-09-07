@@ -71,6 +71,9 @@ AHCICommandProp ahci_command_properties[] = {
                                  .lba48 = true, .read = true },
     { .cmd = CMD_READ_LOG_DMA_EXT, .data = true, .dma = true,
                                  .lba48 = true, .read = true },
+    { .cmd = CMD_ZAC_MGMT_IN,    .data = true,  .pio = true,
+                                 .lba48 = true, .read = true },
+    { .cmd = CMD_ZAC_MGMT_OUT,   .lba48 = true },
     { .cmd = READ_FPDMA_QUEUED,  .data = true,  .dma = true,
                                  .lba48 = true, .read = true, .ncq = true },
     { .cmd = WRITE_FPDMA_QUEUED, .data = true,  .dma = true,
@@ -572,8 +575,12 @@ void ahci_port_check_cmd_sanity(AHCIQState *ahci, AHCICommand *cmd)
     AHCICommandHeader cmdh;
 
     ahci_get_command_header(ahci, cmd->port, cmd->slot, &cmdh);
-    /* Physical Region Descriptor Byte Count is not required to work for NCQ. */
-    if (!cmd->props->ncq) {
+    /*
+     * Physical Region Descriptor Byte Count is not required to work for NCQ.
+     * A command that failed with an error may also have transferred fewer
+     * bytes than requested, so skip the check when an error is expected.
+     */
+    if (!cmd->props->ncq && !cmd->errors) {
         g_assert_cmphex(cmd->xbytes, ==, cmdh.prdbc);
     }
 }
@@ -1205,6 +1212,14 @@ void ahci_command_set_ncq_subcmd(AHCICommand *cmd, uint8_t subcmd)
 
     g_assert(cmd->props->ncq);
     nfis->prio = (nfis->prio & ~0x1f) | (subcmd & 0x1f);
+}
+
+/* Set the 16-bit FEATURE field of a (non-NCQ) command. */
+void ahci_command_set_feature(AHCICommand *cmd, uint16_t feature)
+{
+    g_assert(!cmd->props->ncq);
+    cmd->fis.feature_low = feature & 0xff;
+    cmd->fis.feature_high = (feature >> 8) & 0xff;
 }
 
 void ahci_command_expect_error(AHCICommand *cmd, uint8_t err)
