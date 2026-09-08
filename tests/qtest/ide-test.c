@@ -944,6 +944,62 @@ static void test_sense_data(void)
     free_pci_device(dev);
 }
 
+/*
+ * An access beyond the last logical sector reports ILLEGAL REQUEST / LOGICAL
+ * BLOCK ADDRESS OUT OF RANGE (21h/00h), for both reads and writes.
+ */
+static void test_sense_data_lba_range(void)
+{
+    const uint64_t oob_lba = TEST_IMAGE_SIZE / 512; /* first invalid LBA */
+    QTestState *qts;
+    QPCIDevice *dev;
+    QPCIBar bmdma_bar, ide_bar;
+    uint8_t status, sk, asc, ascq;
+    uintptr_t guest_buf;
+    PrdtEntry prdt[1];
+    int i;
+
+    qts = ide_test_start("-drive file=%s,if=ide,format=raw", tmp_path[0]);
+    qtest_irq_intercept_in(qts, "ioapic");
+    dev = get_pci_device(qts, &bmdma_bar, &ide_bar);
+
+    /* Enable the Sense Data Reporting feature set. */
+    qpci_io_writeb(dev, ide_bar, reg_device, 0);
+    qpci_io_writeb(dev, ide_bar, reg_feature, 0xc3);
+    qpci_io_writeb(dev, ide_bar, reg_nsectors, 0x01);
+    qpci_io_writeb(dev, ide_bar, reg_command, CMD_SET_FEATURES);
+    status = ide_wait_not_busy(dev, ide_bar);
+    assert_bit_clear(status, ERR);
+
+    guest_buf = guest_alloc(&guest_malloc, 512);
+    prdt[0].addr = cpu_to_le32(guest_buf);
+    prdt[0].size = cpu_to_le32(512 | PRDT_EOT);
+
+    /* Both an out-of-range read and write fail with the same sense. */
+    for (i = 0; i < 2; i++) {
+        int cmd = i ? CMD_WRITE_DMA : CMD_READ_DMA;
+
+        send_dma_request(qts, cmd, oob_lba, 1, prdt, ARRAY_SIZE(prdt), NULL);
+
+        status = qpci_io_readb(dev, ide_bar, reg_status);
+        assert_bit_set(status, ERR | SENSE_DATA);
+        assert_bit_set(qpci_io_readb(dev, ide_bar, reg_error), ABRT);
+
+        qpci_io_writeb(dev, ide_bar, reg_command, CMD_REQ_SENSE_DATA);
+        status = ide_wait_not_busy(dev, ide_bar);
+        assert_bit_set(status, SENSE_DATA);
+        ascq = qpci_io_readb(dev, ide_bar, reg_lba_low);
+        asc = qpci_io_readb(dev, ide_bar, reg_lba_middle);
+        sk = qpci_io_readb(dev, ide_bar, reg_lba_high) & 0x0f;
+        g_assert_cmphex(sk, ==, 0x05);  /* ILLEGAL REQUEST */
+        g_assert_cmphex(asc, ==, 0x21);
+        g_assert_cmphex(ascq, ==, 0x00);
+    }
+
+    ide_test_quit(qts);
+    free_pci_device(dev);
+}
+
 static void test_diagnostic(void)
 {
     QTestState *qts;
@@ -2131,6 +2187,7 @@ int main(int argc, char **argv)
 
     qtest_add_func("/ide/identify", test_identify);
     qtest_add_func("/ide/sense_data", test_sense_data);
+    qtest_add_func("/ide/sense_data/lba_range", test_sense_data_lba_range);
 
     qtest_add_func("/ide/diagnostic", test_diagnostic);
 
