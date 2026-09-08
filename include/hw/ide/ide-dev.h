@@ -100,6 +100,19 @@ struct IDEState {
     uint8_t ascq;
     bool sense_data_enabled;
     bool sense_data_avail;
+    /* Most recent NCQ command error (NCQ Command Error log, 10h) */
+    bool ncq_err_valid;
+    /* NCQ error: waiting for log 10h or a reset (SATA 3.5a DFPDMAQ13) */
+    bool ncq_err_state;
+    uint8_t ncq_err_tag;
+    uint8_t ncq_err_status;
+    uint8_t ncq_err_error;
+    uint8_t ncq_err_device;
+    uint8_t ncq_err_sense_key;
+    uint8_t ncq_err_asc;
+    uint8_t ncq_err_ascq;
+    uint16_t ncq_err_count;
+    uint64_t ncq_err_lba;
     bool tray_open;
     bool tray_locked;
     uint8_t cdrom_changed;
