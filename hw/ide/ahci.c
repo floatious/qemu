@@ -1153,6 +1153,22 @@ static void execute_ncq_command(NCQTransferState *ncq_tfs)
     g_assert(is_ncq(ncq_tfs->cmd));
     ncq_tfs->halt = false;
 
+    /*
+     * As for the other read and write commands, an access beyond the last
+     * logical sector fails without reaching the block layer, so that it is
+     * reported to the guest rather than subject to the rerror/werror policy.
+     */
+    if ((ncq_tfs->cmd == READ_FPDMA_QUEUED ||
+         ncq_tfs->cmd == WRITE_FPDMA_QUEUED) &&
+        !ide_sect_range_ok(ide_state, ncq_tfs->lba, ncq_tfs->sector_count)) {
+        block_acct_invalid(blk_get_stats(ide_state->blk),
+                           ncq_tfs->cmd == READ_FPDMA_QUEUED ?
+                           BLOCK_ACCT_READ : BLOCK_ACCT_WRITE);
+        ncq_err(ncq_tfs, SENSE_CODE(LBA_OUT_OF_RANGE));
+        ncq_finish(ncq_tfs);
+        return;
+    }
+
     switch (ncq_tfs->cmd) {
     case READ_FPDMA_QUEUED:
         trace_execute_ncq_command_read(ad->hba, port, ncq_tfs->tag,
