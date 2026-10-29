@@ -1165,6 +1165,66 @@ static void test_flush_retry(void)
     ahci_shutdown(ahci);
 }
 
+/*
+ * An NCQ command issued after a failed non-NCQ command is queued with BSY,
+ * DRQ and ERR cleared (SATA 3.5a DFPDMAQ2), so its PxCI bit is cleared and
+ * it completes without the error of the earlier command.
+ */
+static void test_ncq_after_error(void)
+{
+    AHCIQState *ahci;
+    AHCICommand *cmd;
+    uint32_t bit;
+    uint64_t ptr;
+    uint8_t px;
+    int i;
+
+    prepare_blkdebug_script(debug_path, "write_aio");
+    ahci = ahci_boot_and_enable("-drive file=blkdebug:%s:%s,if=none,id=drive0,"
+                                "format=%s -M q35 -device ide-hd,drive=drive0",
+                                debug_path, tmp_path, imgfmt);
+    px = ahci_port_select(ahci);
+    ahci_port_clear(ahci, px);
+
+    /* A WRITE DMA EXT that fails with the injected I/O error */
+    ptr = ahci_alloc(ahci, 512);
+    cmd = ahci_command_create(CMD_WRITE_DMA_EXT);
+    ahci_command_set_buffer(cmd, ptr);
+    ahci_command_set_size(cmd, 512);
+    ahci_command_commit(ahci, cmd, px);
+    ahci_command_issue(ahci, cmd);
+    g_assert_cmphex(ahci_px_rreg(ahci, px, AHCI_PX_IS) & AHCI_PX_IS_TFES,
+                    !=, 0);
+    ahci_command_free(cmd);
+
+    /* Restart the port, as after any error (AHCI 1.3.1 6.2.2.1) */
+    ahci_px_clr(ahci, px, AHCI_PX_CMD, AHCI_PX_CMD_ST);
+    ahci_port_clear(ahci, px);
+    ahci_px_set(ahci, px, AHCI_PX_CMD, AHCI_PX_CMD_ST);
+
+    cmd = ahci_command_create(READ_FPDMA_QUEUED);
+    ahci_command_set_buffer(cmd, ptr);
+    ahci_command_set_size(cmd, 512);
+    ahci_command_commit(ahci, cmd, px);
+    ahci_command_issue_async(ahci, cmd);
+    bit = 1u << ahci_command_slot(cmd);
+    for (i = 0; i < 100000 && (ahci_px_rreg(ahci, px, AHCI_PX_SACT) & bit);
+         i++) {
+        usleep(50);
+    }
+    g_assert_cmphex(ahci_px_rreg(ahci, px, AHCI_PX_SACT) & bit, ==, 0);
+    /* The command was acknowledged without an error, and PxCI cleared */
+    g_assert_cmphex(ahci_px_rreg(ahci, px, AHCI_PX_IS) & AHCI_PX_IS_TFES,
+                    ==, 0);
+    g_assert_cmphex(ahci_px_rreg(ahci, px, AHCI_PX_CI) & bit, ==, 0);
+    /* STS.ERR and the ERR field: nothing left from the failed command */
+    g_assert_cmphex(ahci_px_rreg(ahci, px, AHCI_PX_TFD) & 0xff01, ==, 0);
+
+    ahci_command_free(cmd);
+    ahci_free(ahci, ptr);
+    ahci_shutdown(ahci);
+}
+
 /**
  * Basic sanity test to boot a machine, find an AHCI device, and shutdown.
  */
@@ -2397,6 +2457,7 @@ int main(int argc, char **argv)
 
     qtest_add_func("/ahci/flush/simple", test_flush);
     qtest_add_func("/ahci/flush/retry", test_flush_retry);
+    qtest_add_func("/ahci/io/ncq/after_error", test_ncq_after_error);
     qtest_add_func("/ahci/flush/migrate", test_flush_migrate);
 
     qtest_add_func("/ahci/migrate/sanity", test_migrate_sanity);
