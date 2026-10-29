@@ -301,6 +301,7 @@ static void ahci_port_write(AHCIState *s, int port, int offset, uint32_t val)
         if ((pr->cmd & PORT_CMD_START) && !(val & PORT_CMD_START)) {
             pr->scr_act = 0;
             pr->cmd_issue = 0;
+            s->dev[port].halted = false;
         }
 
         /* Block any Read-only fields from being set;
@@ -564,6 +565,14 @@ static void check_cmd(AHCIState *s, int port)
     AHCIPortRegs *pr = &s->dev[port].port_regs;
     uint8_t slot;
 
+    /*
+     * After a fatal error the HBA processes no commands until software clears
+     * PxCMD.ST (AHCI 1.3.1 6.2.2).
+     */
+    if (s->dev[port].halted) {
+        return;
+    }
+
     if ((pr->cmd & PORT_CMD_START) && pr->cmd_issue) {
         for (slot = 0; (slot < 32) && pr->cmd_issue; slot++) {
             if (pr->cmd_issue & (1U << slot)) {
@@ -664,6 +673,7 @@ static void ahci_reset_port(AHCIState *s, int port, IDEResetKind kind)
     pr->cmd_issue = 0;
     d->busy_slot = -1;
     d->init_d2h_sent = false;
+    d->halted = false;
 
     ide_state = &s->dev[port].port.ifs[0];
     if (!ide_state->blk) {
@@ -801,6 +811,7 @@ static void ahci_write_fis_sdb(AHCIState *s, NCQTransferState *ncq_tfs)
      */
     if (sdb_fis->status & ERR_STAT) {
         ahci_trigger_irq(s, ad, AHCI_PORT_IRQ_BIT_TFES);
+        ad->halted = true;
     } else if (sdb_fis->flags & 0x40) {
         ahci_trigger_irq(s, ad, AHCI_PORT_IRQ_BIT_SDBS);
     }
@@ -846,6 +857,7 @@ static void ahci_write_fis_pio(AHCIDevice *ad, uint16_t len, bool pio_fis_i)
 
     if (pio_fis[2] & ERR_STAT) {
         ahci_trigger_irq(ad->hba, ad, AHCI_PORT_IRQ_BIT_TFES);
+        ad->halted = true;
     }
 }
 
@@ -888,6 +900,7 @@ static bool ahci_write_fis_d2h(AHCIDevice *ad, bool d2h_fis_i)
     /* TFES IRQ is always raised if ERR_STAT is set, regardless of I bit. */
     if (d2h_fis[2] & ERR_STAT) {
         ahci_trigger_irq(ad->hba, ad, AHCI_PORT_IRQ_BIT_TFES);
+        ad->halted = true;
     } else if (d2h_fis_i) {
         ahci_trigger_irq(ad->hba, ad, AHCI_PORT_IRQ_BIT_DHRS);
     }
@@ -1741,6 +1754,24 @@ static const VMStateDescription vmstate_ncq_tfs = {
     },
 };
 
+static bool ahci_device_halted_needed(void *opaque)
+{
+    AHCIDevice *ad = opaque;
+
+    return ad->halted;
+}
+
+static const VMStateDescription vmstate_ahci_device_halted = {
+    .name = "ahci port/halted",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = ahci_device_halted_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_BOOL(halted, AHCIDevice),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_ahci_device = {
     .name = "ahci port",
     .version_id = 1,
@@ -1769,6 +1800,10 @@ static const VMStateDescription vmstate_ahci_device = {
         VMSTATE_STRUCT_ARRAY(ncq_tfs, AHCIDevice, AHCI_MAX_CMDS,
                              1, vmstate_ncq_tfs, NCQTransferState),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_ahci_device_halted,
+        NULL
     },
 };
 

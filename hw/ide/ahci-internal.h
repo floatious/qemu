@@ -318,6 +318,7 @@ struct AHCIDevice {
     bool done_first_drq;
     int32_t busy_slot;
     bool init_d2h_sent;
+    bool halted; /* fatal error (PxIS.TFES), until PxCMD.ST is cleared */
     AHCICmdHdr *cur_cmd;
     NCQTransferState ncq_tfs[AHCI_MAX_CMDS];
     MemReentrancyGuard mem_reentrancy_guard;

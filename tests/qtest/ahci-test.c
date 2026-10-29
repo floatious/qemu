@@ -1225,6 +1225,70 @@ static void test_ncq_after_error(void)
     ahci_shutdown(ahci);
 }
 
+/*
+ * After a command fails, the HBA processes no further commands until software
+ * clears PxCMD.ST (AHCI 1.3.1 6.2.2), so it does not execute the failed
+ * command again either.
+ */
+static void test_halt_after_error(void)
+{
+    g_autofree unsigned char *before = g_malloc(512);
+    g_autofree unsigned char *tx = g_malloc(512);
+    g_autofree unsigned char *rx = g_malloc(512);
+    AHCIQState *ahci;
+    AHCICommand *cmd;
+    uint32_t pending;
+    uint64_t ptr;
+    unsigned px;
+    int i;
+
+    prepare_blkdebug_script(debug_path, "write_aio");
+    ahci = ahci_boot_and_enable("-drive file=blkdebug:%s:%s,if=none,id=drive0,"
+                                "format=%s -M q35 -device ide-hd,drive=drive0",
+                                debug_path, tmp_path, imgfmt);
+    px = ahci_port_select(ahci);
+    ahci_port_clear(ahci, px);
+    ahci_io(ahci, px, CMD_READ_DMA_EXT, before, 512, 0);
+    memset(tx, before[0] ^ 0xff, 512);
+
+    /* A WRITE DMA EXT that fails with the injected I/O error */
+    ptr = ahci_alloc(ahci, 512);
+    qtest_bufwrite(ahci->parent->qts, ptr, tx, 512);
+    cmd = ahci_command_create(CMD_WRITE_DMA_EXT);
+    ahci_command_set_buffer(cmd, ptr);
+    ahci_command_set_size(cmd, 512);
+    ahci_command_commit(ahci, cmd, px);
+    ahci_command_issue(ahci, cmd);
+    /* Not ahci_command_verify(), which would restart the port */
+    g_assert_cmphex(ahci_px_rreg(ahci, px, AHCI_PX_IS) & AHCI_PX_IS_TFES,
+                    !=, 0);
+    ahci_command_free(cmd);
+
+    /* A command issued without restarting the port is not processed */
+    cmd = ahci_command_create(CMD_READ_DMA_EXT);
+    ahci_command_set_buffer(cmd, ptr);
+    ahci_command_set_size(cmd, 512);
+    ahci_command_commit(ahci, cmd, px);
+    ahci_command_issue_async(ahci, cmd);
+    for (i = 0; i < 1000; i++) {
+        usleep(50);
+    }
+    pending = ahci_px_rreg(ahci, px, AHCI_PX_CI) &
+              (1u << ahci_command_slot(cmd));
+    ahci_command_free(cmd);
+    ahci_free(ahci, ptr);
+
+    /* Restarting the port drops it; the sector still has its old data */
+    ahci_px_clr(ahci, px, AHCI_PX_CMD, AHCI_PX_CMD_ST);
+    ahci_port_clear(ahci, px);
+    ahci_px_set(ahci, px, AHCI_PX_CMD, AHCI_PX_CMD_ST);
+    ahci_io(ahci, px, CMD_READ_DMA_EXT, rx, 512, 0);
+    g_assert_cmphex(memcmp(rx, before, 512), ==, 0);
+    g_assert_cmphex(pending, !=, 0);
+
+    ahci_shutdown(ahci);
+}
+
 /**
  * Basic sanity test to boot a machine, find an AHCI device, and shutdown.
  */
@@ -2458,6 +2522,7 @@ int main(int argc, char **argv)
     qtest_add_func("/ahci/flush/simple", test_flush);
     qtest_add_func("/ahci/flush/retry", test_flush_retry);
     qtest_add_func("/ahci/io/ncq/after_error", test_ncq_after_error);
+    qtest_add_func("/ahci/io/dma/halt_after_error", test_halt_after_error);
     qtest_add_func("/ahci/flush/migrate", test_flush_migrate);
 
     qtest_add_func("/ahci/migrate/sanity", test_migrate_sanity);
